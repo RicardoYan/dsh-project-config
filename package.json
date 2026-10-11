@@ -1,0 +1,69 @@
+{
+  "name": "dsh-project-config",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-workspace subagents, commands, MCP servers and hooks for DSH from .dsh/settings.yml · 从 .dsh/settings.yml 为 DSH 工作区加载子代理、命令、MCP 和 hooks",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/log.js",
+    "lib/workspace.js",
+    "lib/settings.js",
+    "lib/isolation.js",
+    "lib/status.js",
+    "lib/text.js",
+    "lib/locale.js",
+    "lib/features/subagents.js",
+    "lib/features/commands.js",
+    "lib/features/mcp.js",
+    "lib/features/hooks.js",
+    "cordis.patch.yml",
+    "README.md",
+    "docs/settings.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "workspace",
+    "subagent",
+    "mcp",
+    "hooks"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "yaml": "^2.3.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-tool-subagent": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-mcp-client": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-hook-protocol": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-skill-filesystem": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-agent-instructions": ">=0.2.0-rc.2 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.3.0-0",
+    "dsh-workspace-trust": ">=0.1.0 <0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "dsh-workspace-trust": {
+      "optional": true
+    }
+  }
+}

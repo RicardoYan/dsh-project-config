@@ -1,0 +1,5 @@
+# Bundle layer contributed by dsh-project-config.
+# Configuration lives in each workspace's .dsh/settings.yml, not here.
+- insert:
+    - id: dsh-project-config
+      name: 'dsh-project-config'
