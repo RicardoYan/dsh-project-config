@@ -8,6 +8,10 @@ import path from 'node:path';
 import { registerHooks } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
+// The plugin log goes to the temp dir: keep test runs out of the real one.
+const testTemp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'pcfg-temp-')));
+process.env.TEMP = process.env.TMP = process.env.TMPDIR = testTemp;
+
 const PACKAGES = process.env.DSH_PACKAGES;
 if (!PACKAGES || !fs.existsSync(PACKAGES)) {
   console.log('set DSH_PACKAGES to the directory holding @deepseek-ai/* and yaml (DSH install node_modules)');
@@ -534,6 +538,24 @@ hooks:
   const c3 = new McpConnection({ serverName: 's', transport: 'stdio', command: 'x', reconnect: { enabled: false } }, { ctx: {}, register: () => () => {}, log: quietLog, ...clock, transportFactory: fake3.transportFactory, clientFactory: fake3.clientFactory });
   await c3.start();
   check('conn: stdio stderr tail in reason', c3.status().error, 'Connection closed | stderr: line1 / Error: missing API key');
+  // a tool name the scope already holds: failed at once, no retry, child closed
+  const fake4 = fakeMcp();
+  fake4.tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
+  let tx4;
+  const timersBefore = timers.length;
+  const c4 = new McpConnection({ serverName: 'dup', transport: 'stdio', command: 'x' }, {
+    ctx: {}, register: (d) => { throw new Error(`tool "${d.name}" is already registered in this scope`); }, log: quietLog, ...clock,
+    transportFactory: (config) => (tx4 = fake4.transportFactory(config)), clientFactory: fake4.clientFactory,
+  });
+  await c4.start();
+  check('conn: name clash -> failed, no retry', [c4.status().state, c4.status().attempt, timers.length - timersBefore], ['failed', undefined, 0]);
+  check('conn: name clash reason', c4.status().error, 'tool registration failed: tool "mcp__dup__echo" is already registered in this scope');
+  check('conn: name clash closes the connection', [tx4.closed || fake4.current.transport === undefined, c4.gen], [true, undefined]);
+  // a manual reconnect tries again once the clash is gone
+  const reg4 = new Map();
+  c4.register = (d) => { reg4.set(d.name, d); return () => reg4.delete(d.name); };
+  check('conn: reconnect after clash -> connected', (await c4.reconnect()).state, 'connected');
+  await c4.dispose();
   // 12. dispose stops everything
   await conn.dispose();
   check('conn: dispose -> stopped, tools removed, no timers', [conn.status().state, registered.size, timers.length], ['stopped', 0, 0]);
@@ -814,7 +836,85 @@ check('result: object', normalizeResult({ a: 1 }).text, '{\n  "a": 1\n}');
   setLocaleSource(() => uiLang);
 }
 
+// ---------------------------------------------------------------- plugin lifecycle (real Cordis, real stdio children)
+{
+  const { Context } = await import('@deepseek-ai/cordis');
+  const plugin = await import('../lib/index.js');
+  const proj = mk('life');
+  const pidDir = mk('life-pids');
+  write(path.join(proj, 'server.mjs'), [
+    "import fs from 'node:fs'; import path from 'node:path';",
+    "fs.writeFileSync(path.join(process.env.PID_DIR, `${process.pid}.pid`), '');",
+    "let buf = ''; const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n');",
+    "process.stdin.on('data', (c) => { buf += c; let i; while ((i = buf.indexOf('\\n')) >= 0) { const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1); if (!l) continue; const m = JSON.parse(l); if (m.id === undefined) continue;",
+    "  if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 't', version: '1' } } });",
+    "  else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo', inputSchema: { type: 'object' } }] } });",
+    "  else send({ jsonrpc: '2.0', id: m.id, result: {} }); } });",
+    "process.stdin.on('end', () => process.exit(0));",
+  ].join('\n'));
+  write(path.join(proj, '.dsh', 'settings.yml'), `mcp:\n  - serverName: life\n    transport: stdio\n    command: '${process.execPath.replace(/\\/g, '/')}'\n    args: [server.mjs]\n    env: { PID_DIR: '${pidDir.replace(/\\/g, '/')}' }\n`);
+
+  const root = new Context();
+  const agents = new Map();
+  const sessions = new Map();
+  root.provide('agents', { list: () => [...agents.values()], get: (id) => agents.get(id) });
+  root.provide('sessions', { get: (id) => sessions.get(id) });
+  root.provide('workspaceTrust', { state: () => 'trusted', checkTarget: (r, rel, o) => builtinCheckTarget(r, rel, o) });
+  // one agent: its own scope with its own tool table (a duplicate name throws, as in DSH)
+  const makeAgent = (id) => {
+    const tools = new Map();
+    const fiber = root.isolate('tools').plugin({ name: `agent-${id}`, apply: (c) => {
+      c.provide('tools', { register: (d) => {
+        if (tools.has(d.name)) throw new Error(`tool "${d.name}" is already registered in this scope`);
+        tools.set(d.name, d);
+        return () => { if (tools.get(d.name) === d) tools.delete(d.name); };
+      } });
+    } });
+    const session = { id, header: { id, cwd: proj }, snapshotEvents: () => [] };
+    const agent = { id, session, ctx: fiber.ctx, status: 'idle', tools };
+    agents.set(id, agent); sessions.set(id, session);
+    return agent;
+  };
+  const alive = () => fs.readdirSync(pidDir).map((f) => Number.parseInt(f, 10)).filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  const waitFor = async (fn, ms = 10000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await new Promise((r) => setTimeout(r, 50)); } return fn(); };
+  const pluginLog = () => { try { return fs.readFileSync(path.join(testTemp, 'dsh-project-config.log'), 'utf8'); } catch { return ''; } };
+
+  const a = makeAgent('agent-a');                       // live before the plugin loads
+  let fiber = root.plugin(plugin, {});
+  await fiber;
+  truthy('life: existing session mounted and connected', await waitFor(() => a.tools.has('mcp__life__echo')));
+  const b = makeAgent('agent-b');
+  await root.serial('agent/created', { agent: b, source: 'startup' });
+  truthy('life: new session connected', await waitFor(() => b.tools.has('mcp__life__echo')));
+  check('life: one child per session', (await waitFor(() => alive().length === 2)) && alive().length, 2);
+
+  // deleting a session: it leaves the store, its agent stays live, no agent/disposed
+  sessions.delete(b.id);
+  root.emit('session/disposed', b.session);
+  truthy('life: deleted session -> tools removed', await waitFor(() => !b.tools.has('mcp__life__echo')));
+  check('life: deleted session -> its child exits', (await waitFor(() => alive().length === 1)) && alive().length, 1);
+  check('life: other session untouched', a.tools.has('mcp__life__echo'), true);
+
+  // unloading the plugin releases every session
+  await fiber.dispose();
+  check('life: unload -> tools removed', a.tools.size, 0);
+  check('life: unload -> no child left', (await waitFor(() => alive().length === 0)) && alive().length, 0);
+  truthy('life: unload logged', pluginLog().includes('plugin unloaded: released 1 session'));
+
+  // reload with the same live agents: no name clash; the deleted session is skipped
+  fiber = root.plugin(plugin, {});
+  await fiber;
+  truthy('life: reload -> connected again', await waitFor(() => a.tools.has('mcp__life__echo')));
+  await new Promise((r) => setTimeout(r, 300));
+  check('life: reload -> deleted session not mounted', [b.tools.size, alive().length], [0, 1]);
+  check('life: reload -> no name clash', pluginLog().includes('already registered'), false);
+  await fiber.dispose();
+  check('life: second unload -> no child left', (await waitFor(() => alive().length === 0)) && alive().length, 0);
+  for (const ag of agents.values()) await ag.ctx.fiber.dispose();
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
+fs.rmSync(testTemp, { recursive: true, force: true });
 if (failures.length) {
   console.log(`FAIL ${failures.length} / ${passed + failures.length}`);
   for (const f of failures) console.log('  ✗ ' + f);
