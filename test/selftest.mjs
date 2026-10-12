@@ -23,14 +23,16 @@ registerHooks({
   },
 });
 
-const { parseSettings, expandVars, splitPersona, loadSettings } = await import('../lib/settings.js');
+const { parseSettings, expandVars, splitPersona } = await import('../lib/settings.js');
+const { loadProjectSettings: loadSettings, mergeSettings } = await import('../lib/project-settings.js');
 const { builtinFindRoot, builtinCheckTarget, createWorkspace } = await import('../lib/workspace.js');
 const { admits, officialFilter, interceptTools, rosterText } = await import('../lib/features/subagents.js');
 const { McpHub, resolveServerConfig } = await import('../lib/features/mcp.js');
 const { mountHooks, validateHookMatchers, forwardExitCode } = await import('../lib/features/hooks.js');
 const { normalizeResult, loadHandler } = await import('../lib/features/commands.js');
 const { rewriteRoots, patchSkillRoots, installInstructionsMarker, MARKER } = await import('../lib/isolation.js');
-const { statusText } = await import('../lib/status.js');
+const { statusText, reconnectText } = await import('../lib/status.js');
+const { createLog } = await import('../lib/log.js');
 const { setLocaleSource, lang } = await import('../lib/locale.js');
 const { TEXT } = await import('../lib/text.js');
 let uiLang = 'zh';
@@ -48,6 +50,62 @@ function check(label, actual, expected) {
 }
 const truthy = (label, v) => check(label, !!v, true);
 const quietLog = { info() {}, warn() {}, error() {} };
+const settle = async () => { for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r)); };
+
+/** Fake SDK client + transport driven by the test (fields set on the returned object). */
+function fakeMcp() {
+  const f = { tools: [], connectError: undefined, callError: undefined, callResult: { content: [] }, pingError: undefined, stderrText: '', current: undefined };
+  f.transportFactory = (config) => {
+    const listeners = [];
+    const t = { config, closed: false, close: async () => { t.closed = true; }, stderr: { on: (ev, fn) => { if (ev === 'data') listeners.push(fn); } } };
+    t.emitStderr = () => { if (f.stderrText) for (const fn of listeners) fn(f.stderrText); };
+    return t;
+  };
+  f.clientFactory = (onListChanged) => {
+    const c = {
+      transport: undefined, onclose: undefined, onerror: undefined,
+      async connect(transport) {
+        transport.emitStderr();
+        const err = f.connectError?.(transport.config);
+        if (err) throw err;
+        c.transport = transport;
+        f.current = c;
+      },
+      getInstructions: () => '',
+      getServerCapabilities: () => ({ tools: {} }),
+      listTools: async () => ({ tools: f.tools }),
+      callTool: async () => { if (f.callError) throw f.callError; return f.callResult; },
+      ping: async () => { if (f.pingError) throw f.pingError; return {}; },
+      async close() { if (c.transport) { c.transport = undefined; queueMicrotask(() => c.onclose?.()); } },
+      listChanged: () => onListChanged(),
+      closeFromServer() { c.transport = undefined; c.onclose?.(); },
+    };
+    return c;
+  };
+  return f;
+}
+
+/** Minimal agent-scope stand-in for McpHub.startIn. */
+function fakeScope() {
+  const scope = { sections: [], resources: [], registeredTools: new Map() };
+  scope.tools = { register: (d) => { scope.registeredTools.set(d.name, d); return () => scope.registeredTools.delete(d.name); } };
+  scope.inject = (deps, fn) => {
+    if (deps[0] === 'mcpResources') fn({ mcpResources: { register: (name) => { scope.resources.push(name); } } });
+    if (deps[0] === 'systemPrompt') fn({ systemPrompt: { section: (s) => scope.sections.push(s), getSectionOrder: () => 3000 } });
+  };
+  return scope;
+}
+
+/** The official client's internal name rule, loaded from its module source for comparison. */
+async function officialInternals() {
+  const file = path.join(PACKAGES, '@deepseek-ai', 'dsh-mcp-client', 'lib', 'index.js');
+  const src = fs.readFileSync(file, 'utf8');
+  const start = src.indexOf('const MAX_PUBLIC_NAME_LENGTH');
+  const end = src.indexOf('/**', src.indexOf('function publicToolName'));
+  const body = src.slice(start, end).replace(/\/\*\*[\s\S]*?\*\//g, '');
+  const fn = new Function('createHash', `${body}; return { publicToolName };`);
+  return fn((await import('node:crypto')).createHash);
+}
 
 const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'pcfg-')));
 const mk = (...p) => { const d = path.join(tmp, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
@@ -156,6 +214,373 @@ check('check: type', (await builtinCheckTarget(sub, 'inside.md', { type: 'direct
   const loaded = await loadSettings(sub);
   check('load: found', [loaded.ok, loaded.file], [true, path.join(sub, '.dsh', 'settings.yml')]);
   check('load: absent', await loadSettings(gitRoot), undefined);
+}
+
+// ---------------------------------------------------------------- settings.local.yml
+{
+  const ws = (name, shared, local) => {
+    const r = mk('local', name);
+    if (shared !== undefined) write(path.join(r, '.dsh', 'settings.yml'), shared);
+    if (local !== undefined) write(path.join(r, '.dsh', 'settings.local.yml'), local);
+    return r;
+  };
+  const SHARED = `
+subagents:
+  - { toolName: a, personaFile: a.md }
+  - { toolName: b, personaFile: b.md }
+commands:
+  - { name: c1, description: d, handlerFile: c1.mjs }
+  - { name: c2, description: d, handlerFile: c2.mjs }
+mcp:
+  - { serverName: s1, transport: stdio, command: node }
+  - { serverName: s2, transport: stdio, command: node }
+  - { serverName: s3, transport: stdio, command: node }
+hooks:
+  tools/pre-execute:
+    - { command: shared-1 }
+    - { command: shared-2 }
+  agent/pre-step:
+    - { command: shared-step }
+`;
+  const LOCAL = `
+subagents:
+  - { toolName: a, personaFile: a-local.md }
+  - { toolName: z, personaFile: z.md }
+commands:
+  - { name: c1, description: mine, handlerFile: mine.mjs }
+  - { name: c9, description: d, handlerFile: c9.mjs }
+mcp:
+  - { serverName: s2, transport: streamable-http, url: 'http://h/mcp', headers: { Authorization: 'Bearer x' } }
+  - { serverName: s1, enabled: false }
+  - { serverName: s4, transport: stdio, command: node }
+hooks:
+  tools/pre-execute:
+    - { command: local-1 }
+  tools/post-execute:
+    - { command: local-post }
+`;
+  // only shared
+  const onlyShared = await loadSettings(ws('only-shared', SHARED));
+  check('local: only shared', [onlyShared.ok, onlyShared.localFile, onlyShared.settings.mcp.map((m) => m.serverName), onlyShared.warnings.length], [true, undefined, ['s1', 's2', 's3'], 0]);
+  // only local: not loaded at all
+  check('local: only local -> nothing', await loadSettings(ws('only-local', undefined, LOCAL)), undefined);
+  // both
+  const both = await loadSettings(ws('both', SHARED, LOCAL));
+  check('local: both ok', [both.ok, path.basename(both.localFile), both.warnings.length], [true, 'settings.local.yml', 0]);
+  const S = both.settings;
+  check('local: subagents replace in place + append', S.subagents.map((s) => [s.toolName, s.personaFile]), [['a', 'a-local.md'], ['b', 'b.md'], ['z', 'z.md']]);
+  check('local: commands replace in place + append', S.commands.map((c) => [c.name, c.handlerFile]), [['c1', 'mine.mjs'], ['c2', 'c2.mjs'], ['c9', 'c9.mjs']]);
+  check('local: mcp replace in place, remove, append', S.mcp.map((m) => [m.serverName, m.transport]), [['s2', 'streamable-http'], ['s3', 'stdio'], ['s4', 'stdio']]);
+  check('local: mcp replaced whole (no stdio fields left)', 'command' in S.mcp[0], false);
+  check('local: hooks shared first, local appended', S.hooks['tools/pre-execute'].map((h) => h.command), ['shared-1', 'shared-2', 'local-1']);
+  check('local: hooks other events', [S.hooks['agent/pre-step'].map((h) => h.command), S.hooks['tools/post-execute'].map((h) => h.command)], [['shared-step'], ['local-post']]);
+  check('local: origin marks', [[...both.origin.subagents], [...both.origin.commands], [...both.origin.mcp]],
+    [[['a', 'override'], ['z', 'local']], [['c1', 'override'], ['c9', 'local']], [['s2', 'override'], ['s4', 'local']]]);
+  check('local: hooksLocal', both.hooksLocal, { 'tools/pre-execute': 1, 'tools/post-execute': 1 });
+  check('local: removed', both.removed, [{ kind: 'mcp', name: 's1' }]);
+
+  // hooks run order through the real mountHooks: shared then local
+  {
+    const ran = [];
+    const listeners = {};
+    const shell = { resolve: (req) => req, execute: async (spec) => { ran.push(spec.command.split('\n')[0]); return { result: async () => ({ exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }) }; } };
+    const fakeCtx = { inject: (deps, fn) => { fn({ on: (e, cb) => { listeners[e] = cb; }, effect: () => {}, get: (n) => (n === 'shell' ? shell : undefined) }); return {}; } };
+    mountHooks(fakeCtx, { hooks: S.hooks, root: tmp, log: quietLog, label: 't', stats: { runs: 0, failures: 0 } });
+    await listeners['tools/pre-execute']({ name: 'read', agent: { id: 'x', session: { header: { cwd: tmp } } }, arguments: {}, callId: 'c', signal: new AbortController().signal }, async () => ({ kind: 'allow' }));
+    check('local: hooks execution order', ran, ['shared-1', 'shared-2', 'local-1']);
+  }
+
+  // enabled: false in shared -> warning, entry kept; enabled in hooks -> unknown field
+  const sharedEnabled = await loadSettings(ws('shared-enabled', 'mcp:\n  - { serverName: k, transport: stdio, command: node, enabled: false }\nhooks:\n  agent/pre-step:\n    - { command: x, enabled: false }\n'));
+  check('local: enabled in shared ignored, entry kept', sharedEnabled.settings.mcp.map((m) => m.serverName), ['k']);
+  check('local: enabled in shared warns (zh/en)', [inLang('zh', () => `${sharedEnabled.warnings[0]}`), inLang('en', () => `${sharedEnabled.warnings[0]}`)],
+    ['settings.yml：mcp[0] (k)：enabled 只能写在 settings.local.yml 里，已忽略', 'settings.yml: mcp[0] (k): enabled only works in settings.local.yml; ignored']);
+  truthy('local: enabled on a hook is an unknown field', inLang('en', () => `${sharedEnabled.warnings[1]}`).includes('unknown field "enabled"'));
+
+  // enabled: false for a name not in shared; enabled: 'no' is skipped; enabled: true keeps
+  const odd = await loadSettings(ws('odd', 'mcp:\n  - { serverName: k, transport: stdio, command: node }\n',
+    'mcp:\n  - { serverName: ghost, enabled: false }\n  - { serverName: k, enabled: "no", transport: stdio, command: other }\n  - { serverName: t, enabled: true, transport: stdio, command: node }\n'));
+  check('local: odd enabled results', [odd.settings.mcp.map((m) => [m.serverName, m.command]), odd.removed], [[['k', 'node'], ['t', 'node']], []]);
+  const oddEn = inLang('en', () => odd.warnings.map(String));
+  check('local: odd enabled warnings', oddEn, [
+    'settings.local.yml: mcp[1] (k): enabled must be true or false; skipped',
+    'settings.local.yml: mcp[0] (ghost): no entry of that name in settings.yml; enabled: false has no effect',
+  ]);
+
+  // a bad local entry is skipped; the shared one of the same name stays
+  const badEntry = await loadSettings(ws('bad-entry', SHARED, 'mcp:\n  - { serverName: s2, transport: ftp }\nsubagents:\n  - { toolName: a }\n'));
+  check('local: bad entry keeps shared', [badEntry.settings.mcp.map((m) => [m.serverName, m.transport]), badEntry.settings.subagents.map((s) => s.personaFile), [...badEntry.origin.mcp]],
+    [[['s1', 'stdio'], ['s2', 'stdio'], ['s3', 'stdio']], ['a.md', 'b.md'], []]);
+  check('local: bad entry warnings name the file (zh)', inLang('zh', () => badEntry.warnings.map(String)), [
+    'settings.local.yml：subagents[0] (a)：缺少 personaFile，已跳过',
+    'settings.local.yml：mcp[0] (s2)：transport 只能是 stdio 或 streamable-http，已跳过',
+  ]);
+  // invalid matcher in local is dropped with the file name
+  const badMatcher = await loadSettings(ws('bad-matcher', SHARED, 'hooks:\n  tools/pre-execute:\n    - { matcher: "(", command: x }\n'));
+  check('local: bad matcher dropped', badMatcher.settings.hooks['tools/pre-execute'].map((h) => h.command), ['shared-1', 'shared-2']);
+  truthy('local: bad matcher warning prefixed', inLang('en', () => `${badMatcher.warnings[0]}`).startsWith('settings.local.yml: hooks.tools/pre-execute[0]:'));
+
+  // broken local YAML / non-mapping / too big: whole local ignored, shared intact
+  const SECRET = 'SEKRIT-7f3a9c';
+  for (const [name, text, en, zh] of [
+    ['yaml', `mcp:\n  - serverName: s2\n    headers: { Authorization: Bearer ${SECRET}\n  x: [`, 'settings.local.yml: YAML parse error at line 4, column 3; the whole file is ignored', 'settings.local.yml：YAML 解析失败（第 4 行第 3 列），整份文件已忽略'],
+    ['list', '- 1\n', 'settings.local.yml: must be a mapping at the top level; the whole file is ignored', 'settings.local.yml：顶层必须是映射，整份文件已忽略'],
+    ['big', `# ${'x'.repeat(1024 * 1024)}\n`, 'settings.local.yml: exceeds 1MB; the whole file is ignored', 'settings.local.yml：超过 1MB，整份文件已忽略'],
+  ]) {
+    const r = await loadSettings(ws(`broken-${name}`, SHARED, text));
+    check(`local: broken ${name} -> shared intact`, [r.ok, r.settings.mcp.map((m) => m.serverName), Object.keys(r.origin.mcp).length, r.removed], [true, ['s1', 's2', 's3'], 0, []]);
+    check(`local: broken ${name} warning`, [inLang('en', () => r.warnings.map(String)), inLang('zh', () => r.warnings.map(String))], [[en], [zh]]);
+    truthy(`local: broken ${name} localFile shown`, r.localFile?.endsWith('settings.local.yml'));
+  }
+  // broken shared: error names settings.yml; local not read
+  const brokenShared = await loadSettings(ws('broken-shared', `a: [ ${SECRET}`, LOCAL));
+  check('local: broken shared', [brokenShared.ok, brokenShared.localFile, inLang('en', () => `${brokenShared.error}`)], [false, undefined, 'settings.yml: YAML parse error at line 1, column 19']);
+  check('local: yaml error hides source text', inLang('en', () => `${brokenShared.error}`).includes(SECRET), false);
+  // a directory named settings.local.yml is ignored silently
+  const dirLocal = ws('dir-local', SHARED);
+  mk('local', 'dir-local', '.dsh', 'settings.local.yml');
+  const dl = await loadSettings(dirLocal);
+  check('local: directory ignored silently', [dl.localFile, dl.warnings.length], [undefined, 0]);
+  // .dsh as a link: both files come from the link target
+  {
+    const shared = mk('local', 'linked-target');
+    write(path.join(shared, 'settings.yml'), SHARED);
+    write(path.join(shared, 'settings.local.yml'), LOCAL);
+    const w = mk('local', 'linked-ws');
+    fs.symlinkSync(shared, path.join(w, '.dsh'), 'junction');
+    const r = await loadSettings(w);
+    check('local: .dsh link reads local from target', [r.ok, r.settings.mcp.map((m) => m.serverName)], [true, ['s2', 's3', 's4']]);
+  }
+  // pure merge: empty local is a no-op
+  const base = { subagents: [{ toolName: 'a' }], commands: [], mcp: [], hooks: { 'agent/pre-step': [{ command: 'x' }] } };
+  const noop = mergeSettings(base, { subagents: [], commands: [], mcp: [], hooks: {} });
+  check('merge: empty local no-op', [noop.settings, noop.removed, noop.warnings], [base, [], []]);
+
+  // /project-config marks, both languages
+  const m = { root: tmp, file: both.file, localFile: both.localFile, ok: true, trust: 'untrusted', warnings: [], gatedWarnings: [],
+    subagentSpecs: S.subagents.map((entry) => ({ entry })), deferredSpecs: [], settings: S, origin: both.origin, hooksLocal: both.hooksLocal, removed: both.removed, stats: { runs: 0, failures: 0 } };
+  const zh = inLang('zh', () => statusText(m, { hasTrust: true, logFile: 'L' })).split('\n');
+  const en = inLang('en', () => statusText(m, { hasTrust: true, logFile: 'L' })).split('\n');
+  check('status local: zh', zh.slice(1), [
+    `配置文件：${both.file} + ${both.localFile}`,
+    '信任：不信任',
+    '子代理：a (local 覆盖), b, z (local)',
+    '命令（需要信任）：/c1 (local 覆盖), /c2, /c9 (local)',
+    'MCP（需要信任）：s2 (local 覆盖), s3, s4 (local)',
+    'Hooks（需要信任）：tools/pre-execute ×3（local 1）, agent/pre-step ×1, tools/post-execute ×1（local 1）',
+    '已移除（local enabled: false）：MCP s1',
+    '日志：L',
+  ]);
+  check('status local: en', en.slice(1), [
+    `Settings: ${both.file} + ${both.localFile}`,
+    'Trust: Not trusted',
+    'Subagents: a (local override), b, z (local)',
+    'Commands (requires trust): /c1 (local override), /c2, /c9 (local)',
+    'MCP (requires trust): s2 (local override), s3, s4 (local)',
+    'Hooks (requires trust): tools/pre-execute ×3 (local 1), agent/pre-step ×1, tools/post-execute ×1 (local 1)',
+    'Removed (local enabled: false): MCP s1',
+    'Log: L',
+  ]);
+  check('status local: en has no chinese', CJK.test(en.join('\n')), false);
+  const connected = { ...m, trust: 'trusted', hub: { summary: () => [{ name: 's2', status: 'connected', detail: TEXT.tools(2) }] } };
+  truthy('status local: connected server marked', inLang('zh', () => statusText(connected, { hasTrust: true, logFile: 'L' })).includes('MCP s2 (local 覆盖)：✓ 已连接 — 2 个工具'));
+}
+
+// ---------------------------------------------------------------- secrets stay out of logs and status
+{
+  const SECRET = 'SEKRIT-7f3a9c';
+  const { secretsOf, redact } = await import('../lib/features/mcp.js');
+  const cfg = { serverName: 'knot', transport: 'streamable-http', url: `https://u:${SECRET}p@knot.example/mcp?key=${SECRET}q`, headers: { Authorization: `Bearer ${SECRET}`, 'X-Api-Key': `${SECRET}k` } };
+  const msg = `HTTP POST ${cfg.url} failed: 401 (${cfg.headers.Authorization}; raw ${SECRET}; host knot.example)`;
+  const cleaned = redact(msg, secretsOf(cfg));
+  check('redact: no secret left', [cleaned.includes(SECRET), cleaned.includes('knot.example')], [false, false]);
+  truthy('redact: scheme kept', cleaned.includes('Bearer ***') || cleaned.includes('***'));
+  check('redact: short values ignored', secretsOf({ headers: { A: 'x' } }), []);
+
+  // a real hub + connection, with a client whose errors quote the resolved url and token
+  const logFile = path.join(tmp, 'secret.log');
+  const log = createLog(logFile);
+  const hub = new McpHub(log, '[w:1]');
+  const port = 45678;
+  const entry = { serverName: 'knot', transport: 'streamable-http', url: `http://127.0.0.1:${port}/mcp?token=\${PCFG_TEST_Q}`, headers: { Authorization: `Bearer ${SECRET}` }, reconnect: { enabled: false } };
+  let seenConfig;
+  const fake = fakeMcp();
+  fake.connectError = (config) => new Error(`HTTP POST ${config.url} failed: 401 ${config.headers.Authorization}; server said: bad token ${SECRET}`);
+  await hub.startIn(fakeScope(), [entry], (e) => resolveServerConfig(e, tmp, async () => ({ ok: false }), { PCFG_TEST_Q: `${SECRET}q` }),
+    { transportFactory: (config) => { seenConfig = config; return fake.transportFactory(config); }, clientFactory: fake.clientFactory });
+  check('secrets: connection got real values', [seenConfig.headers.Authorization, seenConfig.url.endsWith(`${SECRET}q`)], [`Bearer ${SECRET}`, true]);
+  const summary = hub.summary();
+  const status = inLang('en', () => statusText({ root: tmp, file: 'F', ok: true, trust: 'trusted', warnings: [], gatedWarnings: [], subagentSpecs: [], deferredSpecs: [],
+    settings: { subagents: [], commands: [], mcp: [entry], hooks: {} }, hub, stats: { runs: 0, failures: 0 } }, { hasTrust: true, logFile }));
+  const logText = fs.readFileSync(logFile, 'utf8');
+  check('secrets: server failed', summary[0].status, 'failed');
+  truthy('secrets: something was logged', logText.length > 0);
+  check('secrets: not in log', logText.includes(SECRET), false);
+  check('secrets: not in status', status.includes(SECRET), false);
+  check('secrets: url not in log or status', [logText.includes(`127.0.0.1:${port}`), status.includes(`127.0.0.1:${port}`)], [false, false]);
+  await hub.disposeAll();
+}
+
+// ---------------------------------------------------------------- MCP connection: real state, reconnect
+{
+  const { McpConnection, publicToolName, resolveReconnectPolicy, isConnectionError } = await import('../lib/features/mcp-connection.js');
+  const { publicToolName: officialName } = await officialInternals();
+  // tool names identical to the official client
+  for (const [srv, raw] of [['knot', 'search'], ['k', 'a.b/c'], ['server', 'x'.repeat(80)], ['s-1', 'ok_name']]) {
+    check(`names: ${srv}/${raw.slice(0, 12)} same as official`, publicToolName(srv, raw), officialName(srv, raw));
+  }
+  check('policy: defaults', resolveReconnectPolicy(undefined), { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10 });
+  let threw;
+  try { resolveReconnectPolicy({ attempts: 3 }); } catch (e) { threw = e.message; }
+  check('policy: unknown key rejected', threw, 'reconnect.attempts is not a reconnect option');
+  check('connection error: typed codes only', [isConnectionError({ code: 'CONNECTION_CLOSED' }), isConnectionError({ code: 'REQUEST_TIMEOUT' }), isConnectionError(new Error('connection closed')), isConnectionError({ cause: { code: 'ECONNREFUSED' } })], [true, false, false, true]);
+
+  // a manual clock and timers
+  let now = 1000;
+  const timers = [];
+  const clock = { now: () => now, setTimer: (fn, ms) => { const t = { fn, at: now + ms }; timers.push(t); return t; }, clearTimer: (t) => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); } };
+  const fire = async () => { const t = timers.shift(); now = t.at; t.fn(); await settle(); };
+  const fake = fakeMcp();
+  const registered = new Map();
+  const conn = new McpConnection({ serverName: 'k', transport: 'streamable-http', url: 'http://h/mcp' }, {
+    ctx: {}, register: (d) => { registered.set(d.name, d); return () => registered.delete(d.name); }, log: quietLog, ...clock,
+    transportFactory: fake.transportFactory, clientFactory: fake.clientFactory,
+  });
+  const view = () => { const st = conn.status(); return [st.state, st.tools, st.error, st.attempt]; };
+  // 1. server down at start: retrying with the real error object
+  fake.connectError = () => Object.assign(new Error('Version negotiation failed: the server requires authorization (HTTP 401)'), { code: 'CLIENT_HTTP_AUTHENTICATION' });
+  await conn.start();
+  check('conn: first attempt fails -> retrying', view(), ['retrying', 0, 'Version negotiation failed: the server requires authorization (HTTP 401)', { n: 1, max: 10 }]);
+  check('conn: backoff 500ms', timers[0].at - now, 500);
+  await fire();
+  check('conn: second failure -> attempt 2, 1000ms', [view()[0], view()[3], timers[0].at - now], ['retrying', { n: 2, max: 10 }, 1000]);
+  // 2. server comes up: next attempt connects, tools registered
+  fake.connectError = undefined;
+  fake.tools = [{ name: 'whoami', inputSchema: { type: 'object', properties: {} } }];
+  await fire();
+  check('conn: connected with tools, error cleared', view(), ['connected', 1, undefined, undefined]);
+  check('conn: official tool name registered', [...registered.keys()], ['mcp__k__whoami']);
+  // a tool call goes to the live client
+  fake.callResult = { content: [{ type: 'text', text: 'you are k' }] };
+  const def = registered.get('mcp__k__whoami');
+  const callOut = await def.execute({}, { signal: new AbortController().signal, agent: undefined });
+  check('conn: call result through official definition', callOut.content[0].text, 'you are k');
+  // 3. tools/list_changed re-syncs
+  fake.tools = [{ name: 'whoami', inputSchema: { type: 'object' } }, { name: 'echo', inputSchema: { type: 'object' } }];
+  await fake.current.listChanged();
+  await settle();
+  check('conn: list_changed re-synced', [...registered.keys()].sort(), ['mcp__k__echo', 'mcp__k__whoami']);
+  // 4. transport closes: reconnecting, tools kept (official behaviour), error recorded
+  fake.connectError = () => Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+  fake.current.closeFromServer();
+  await settle();
+  // up for less than maxDelayMs: same outage, the budget continues (official rule)
+  check('conn: lost -> reconnecting, tools kept, budget continues', [view()[0], view()[1], view()[3]], ['reconnecting', 2, { n: 3, max: 10 }]);
+  await fire();
+  check('conn: reconnect attempt failed -> cause with network code', [view()[0], view()[2]], ['reconnecting', 'fetch failed (ECONNREFUSED)']);
+  // a call during the outage fails clearly
+  let callErr;
+  try { await registered.get('mcp__k__echo').execute({}, { signal: new AbortController().signal }); } catch (e) { callErr = String(e.message); }
+  truthy('conn: call while down explains state', callErr?.includes('not connected (reconnecting'));
+  // 5. exhaust the budget -> failed, tools removed
+  while (timers.length) await fire();
+  check('conn: gave up -> failed, tools removed', [view()[0], view()[1], view()[2]], ['failed', 0, 'fetch failed (ECONNREFUSED)']);
+  // 6. manual reconnect brings it back at once, fresh budget
+  fake.connectError = undefined;
+  const after = await conn.reconnect();
+  check('conn: manual reconnect -> connected', [after.state, after.tools, conn.attempt], ['connected', 2, 0]);
+  // 7. a call failing at the transport level marks the connection lost
+  fake.callError = Object.assign(new Error('Connection closed'), { code: 'CONNECTION_CLOSED' });
+  fake.connectError = () => new Error('still down');
+  try { await registered.get('mcp__k__echo').execute({}, { signal: new AbortController().signal }); } catch { /* expected */ }
+  await settle();
+  check('conn: transport error on call -> reconnecting', [view()[0], view()[2]], ['reconnecting', 'Connection closed']);
+  // a JSON-RPC error answer does not
+  fake.connectError = undefined; fake.callError = undefined;
+  await conn.reconnect();
+  const { ProtocolError } = await import('@modelcontextprotocol/client');
+  fake.callError = new ProtocolError(-32602, 'bad args');
+  try { await registered.get('mcp__k__echo').execute({}, { signal: new AbortController().signal }); } catch { /* expected */ }
+  check('conn: protocol error keeps connected', view()[0], 'connected');
+  fake.callError = undefined;
+  // 8. ping check: dead server found without a call
+  fake.pingError = Object.assign(new Error('Connection closed'), { code: 'CONNECTION_CLOSED' });
+  fake.connectError = () => new Error('down');
+  await conn.check();
+  check('conn: ping failure -> reconnecting', view()[0], 'reconnecting');
+  fake.pingError = undefined;
+  // 9. reconnect while retrying cancels the timer
+  fake.connectError = undefined;
+  const pending = timers.length;
+  await conn.reconnect();
+  check('conn: reconnect cancels pending retry', [pending > 0, timers.length, view()[0]], [true, 0, 'connected']);
+  // 10. stable connection resets the budget after a drop
+  now += 31000;
+  fake.connectError = () => new Error('down');
+  conn.attempt = 7;
+  fake.current.closeFromServer();
+  await settle();
+  check('conn: stable >= maxDelayMs resets budget', view()[3], { n: 1, max: 10 });
+  // 11. reconnect disabled
+  const fake2 = fakeMcp();
+  fake2.connectError = () => new Error('nope');
+  const c2 = new McpConnection({ serverName: 'd', transport: 'stdio', command: 'x', reconnect: { enabled: false } }, { ctx: {}, register: () => () => {}, log: quietLog, ...clock, transportFactory: fake2.transportFactory, clientFactory: fake2.clientFactory });
+  await c2.start();
+  check('conn: reconnect disabled -> failed at once', [c2.status().state, c2.status().error], ['failed', 'nope']);
+  // stdio stderr tail is part of the reason
+  const fake3 = fakeMcp();
+  fake3.stderrText = 'line1\nError: missing API key\n';
+  fake3.connectError = () => Object.assign(new Error('Connection closed'), { code: 'CONNECTION_CLOSED' });
+  const c3 = new McpConnection({ serverName: 's', transport: 'stdio', command: 'x', reconnect: { enabled: false } }, { ctx: {}, register: () => () => {}, log: quietLog, ...clock, transportFactory: fake3.transportFactory, clientFactory: fake3.clientFactory });
+  await c3.start();
+  check('conn: stdio stderr tail in reason', c3.status().error, 'Connection closed | stderr: line1 / Error: missing API key');
+  // 12. dispose stops everything
+  await conn.dispose();
+  check('conn: dispose -> stopped, tools removed, no timers', [conn.status().state, registered.size, timers.length], ['stopped', 0, 0]);
+  await c2.dispose(); await c3.dispose();
+
+  // hub: reconnect by name / all-not-connected, summary text
+  const fakeH = fakeMcp();
+  fakeH.tools = [{ name: 't', inputSchema: { type: 'object' } }];
+  const hub = new McpHub(quietLog, 't');
+  const scope = fakeScope();
+  let downName = 'b';
+  const factories = {
+    ...clock,
+    transportFactory: (config) => { const t = fakeH.transportFactory(config); t.serverName = config.serverName; return t; },
+    clientFactory: fakeH.clientFactory,
+  };
+  fakeH.connectError = (config) => (config.serverName === downName ? Object.assign(new Error('HTTP 401'), { code: 'CLIENT_HTTP_AUTHENTICATION' }) : undefined);
+  await hub.startIn(scope, [{ serverName: 'a' }, { serverName: 'b' }, { serverName: 'c' }], async (e) => (e.serverName === 'c' ? { error: 'cwd: bad' } : { config: { serverName: e.serverName, transport: 'streamable-http', url: 'http://h/' + e.serverName } }), factories);
+  const sum = () => hub.summary().map((x) => [x.name, x.status, x.detail === undefined ? undefined : inLang('en', () => `${x.detail}`)]);
+  check('hub: summary', sum(), [['a', 'connected', '1 tool'], ['b', 'retrying', 'HTTP 401 (retry 1/10)'], ['c', 'skipped', 'cwd: bad']]);
+  check('hub: instructions + resources registered', [scope.sections.map((x) => x.name), scope.resources], [['mcp:a', 'mcp:b'], ['a', 'b']]);
+  downName = undefined;
+  check('hub: reconnect all -> only not-connected', await hub.reconnect(), ['b']);
+  check('hub: b connected now', sum()[1], ['b', 'connected', '1 tool']);
+  check('hub: reconnect all when all up -> nothing', await hub.reconnect(), []);
+  check('hub: reconnect connected one by name', await hub.reconnect('a'), ['a']);
+  check('hub: unknown name', await hub.reconnect('zz'), undefined);
+  check('hub: skipped server cannot reconnect', await hub.reconnect('c'), []);
+  // reconnect output, both languages
+  const root = { hub, origin: { mcp: new Map([['b', 'local']]) } };
+  check('reconnect text', [inLang('zh', () => reconnectText(root, ['b'])), inLang('en', () => reconnectText(root, ['b']))],
+    ['MCP b (local)：✓ 已连接 — 1 个工具', 'MCP b (local): ✓ connected — 1 tool']);
+  await hub.disposeAll();
+  check('hub: disposeAll stops connections', hub.summary().map((x) => x.status), ['stopped', 'stopped', 'skipped']);
+
+  check('mcp state: zh labels', inLang('zh', () => [`${TEXT.mcpState.retrying}`, `${TEXT.mcpState.reconnecting}`, `${TEXT.mcpRetry('X', { n: 2, max: 10 })}`, `${TEXT.tools(1)}`]),
+    ['✗ 连接失败，重试中', '⟳ 连接断开，重连中', 'X（第 2/10 次重试）', '1 个工具']);
+  check('mcp state: en plural', inLang('en', () => [`${TEXT.tools(0)}`, `${TEXT.tools(1)}`, `${TEXT.tools(2)}`]), ['0 tools', '1 tool', '2 tools']);
+  const m = { root: tmp, file: 'F', ok: true, trust: 'trusted', warnings: [], gatedWarnings: [], subagentSpecs: [], deferredSpecs: [], settings: { subagents: [], commands: [], mcp: [{ serverName: 'k' }], hooks: {} }, stats: { runs: 0, failures: 0 },
+    hub: { summary: () => [{ name: 'k', status: 'retrying', detail: TEXT.mcpRetry('HTTP 401', { n: 1, max: 10 }) }] } };
+  truthy('mcp state: status line en', inLang('en', () => statusText(m, { hasTrust: true, logFile: 'L' })).includes('MCP k: ✗ failed, retrying — HTTP 401 (retry 1/10)'));
+  truthy('mcp state: status line zh', inLang('zh', () => statusText(m, { hasTrust: true, logFile: 'L' })).includes('MCP k：✗ 连接失败，重试中 — HTTP 401（第 1/10 次重试）'));
+}
+{
+  const { DEFAULT_LOG_FILE } = await import('../lib/log.js');
+  check('log: default path has no 8.3 short names', /~\d/.test(DEFAULT_LOG_FILE), false);
+  check('log: default path is the real temp dir', path.dirname(DEFAULT_LOG_FILE), fs.realpathSync.native(os.tmpdir()));
 }
 
 // ---------------------------------------------------------------- filters / tools interception

@@ -4,13 +4,14 @@
 
 ## 1. 先看这几条（最常踩的坑）
 
-1. **文件名只认 `.dsh/settings.yml`**。其他文件名（如 `project-config.yml`）不读取，也不提示
-2. **改完配置要新开会话**才生效；当前会话发 `/project-config` 看读到了什么、哪些被跳过、为什么
-3. **写错的字段不会报错**，只在 `/project-config` 里给一条 `⚠`。改完配置先看一眼
-4. **工具名用 DSH 的名字**：`read`、`write`、`edit`、`grep`、`glob`、`pwsh`（Windows）/ `bash`（macOS、Linux），不是 `Read`、`Bash`。`toolFilter` 里写了当前 DSH 不存在的工具名，这个子代理会启动失败
-5. **命令、MCP、hooks 要工作区已信任才运行**（需要装 [dsh-workspace-trust](https://github.com/RicardoYan/dsh-workspace-trust)），子代理不需要
-6. **`skills` 字段已不支持**：skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读
-7. **hooks 的事件名是 DSH 的**（`tools/pre-execute`），不是 `PreToolUse`；Windows 上 hook 命令由 PowerShell 执行
+1. **文件名只认 `.dsh/settings.yml`**，外加个人用的 `.dsh/settings.local.yml`（见 §7）。其他文件名（如 `project-config.yml`）不读取，也不提示
+2. **凭据写在 `settings.local.yml`，并把它加进 `.gitignore`**。`settings.yml` 会提交到 git，不要写 token
+3. **改完配置要新开会话**才生效；当前会话发 `/project-config` 看读到了什么、哪些被跳过、为什么
+4. **写错的字段不会报错**，只在 `/project-config` 里给一条 `⚠`。改完配置先看一眼
+5. **工具名用 DSH 的名字**：`read`、`write`、`edit`、`grep`、`glob`、`pwsh`（Windows）/ `bash`（macOS、Linux），不是 `Read`、`Bash`。`toolFilter` 里写了当前 DSH 不存在的工具名，这个子代理会启动失败
+6. **命令、MCP、hooks 要工作区已信任才运行**（需要装 [dsh-workspace-trust](https://github.com/RicardoYan/dsh-workspace-trust)），子代理不需要
+7. **`skills` 字段已不支持**：skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读
+8. **hooks 的事件名是 DSH 的**（`tools/pre-execute`），不是 `PreToolUse`；Windows 上 hook 命令由 PowerShell 执行
 
 ## 2. 文件位置与工作区
 
@@ -20,7 +21,7 @@
 - 路径（含符号链接跟随后的真实路径）指向工作区外时，需要工作区已信任，且不在禁止访问列表里
 - `.dsh` 本身可以是指向别处的符号链接（含 Windows junction），比如几个项目共用一份配置：`settings.yml` 和 `.dsh/skills/` 照常读取，工作区根仍是放链接的这个目录。但 `.dsh/` 里的 persona、命令文件算作工作区外，未信任时这些子代理不可用（`/project-config` 显示「需要信任」）；链接目标在禁止访问列表里时，即使已信任也不可用
 - 有 `settings.yml` 的工作区只读自己的 `AGENTS.md` / `CLAUDE.md` 和 `.dsh/skills/`、`.agents/skills/`，**不再继承外层 git 仓库根目录的**。例如 monorepo 的子目录 `packages/app` 放了 `settings.yml`，它就是一个独立的工作区：外层仓库根的 `AGENTS.md` 不会被读到；`packages/shared` 对它来说也在工作区外
-- `settings.yml` 和 persona 文件各不超过 1MB；YAML 顶层必须是映射
+- `settings.yml`、`settings.local.yml` 和 persona 文件各不超过 1MB；YAML 顶层必须是映射
 
 顶层只有四个字段，都可省略：
 
@@ -72,7 +73,7 @@ description: 审查代码改动并指出问题
 
 - 不写：子代理拥有和主会话一样的工具
 - `allow` 是白名单：**没列出的都没有**。写了 `allow` 却漏掉 `read`，子代理就读不了文件
-- 工具名必须是当前 DSH 里存在的（见 §1 第 4 条）。启动失败时报错 `tools.restrict() names unknown global tool "..."`，后面会列出可用的工具名
+- 工具名必须是当前 DSH 里存在的（见 §1 第 5 条）。启动失败时报错 `tools.restrict() names unknown global tool "..."`，后面会列出可用的工具名
 - MCP 工具写全名：`mcp__<serverName>__<工具名>`
 - DSH 自带的通用 `subagent` 工具（和 `list_subagent_models`）每个子代理都有，`toolFilter` 管不到，写不写都一样；它能嵌套几层由 DSH 设置里的子代理层数上限决定
 
@@ -102,7 +103,7 @@ commands:
   - name: release-notes                  # 必填，/release-notes
     description: 生成发布说明             # 必填，命令列表里显示
     handlerFile: .dsh/commands/release-notes.mjs   # 必填
-    input: { hint: '<版本号>' }          # 可选：输入提示；attachments: true 允许带附件
+    input: { hint: '<版本号>' }          # 要带参数就必须写（见下）；attachments: true 允许带附件
 ```
 
 处理文件按 ES 模块加载（建议用 `.mjs` 扩展名）：
@@ -116,13 +117,14 @@ export default async ({ rawInput, workspaceRoot, agent, attachments, signal }) =
 };
 ```
 
+- **要接收参数，必须写 `input`**：没写 `input` 的命令只能单独发 `/<name>`；后面带了文字（如 `/release-notes 1.2`），DSH 输入框会把整行当普通消息发给模型，命令不会执行。写了 `input` 后，选中命令或输入 `/<name>` 加空格，输入框会显示 `hint`，接着输入参数再回车
 - 返回值：字符串；或 `{ kind: 'success' | 'error', text }`；其他值按 JSON 显示；抛异常显示为错误
 - 处理文件改了**不用新开会话**，下次执行时自动重新加载（`settings.yml` 本身改了仍要新开会话）
 - 不要和 DSH 自带命令同名，否则在这个会话里会把自带命令遮住
 
 ## 5. `mcp`：MCP 服务器
 
-需要工作区已信任。每个主会话连一次，**子代理共用主会话的连接**，按各自的 `toolFilter` 过滤。第一次调用模型前会等所有服务器连接完成。
+需要工作区已信任。每个主会话连一次，**子代理共用主会话的连接**，按各自的 `toolFilter` 过滤。第一次调用模型前会等所有服务器第一次连接出结果。连接由本插件自己管理（用 DSH 自带的 MCP SDK），行为和 DSH 内置的 MCP 客户端一致：工具名 `mcp__<serverName>__<工具>`、服务器说明加进系统提示、资源可用 DSH 的 MCP 资源工具读取、工具列表变化自动刷新。
 
 ```yaml
 mcp:
@@ -145,18 +147,60 @@ mcp:
 | `command` / `args` / `env` / `cwd` | 仅 stdio。直接启动程序，不经过 shell；`args` 里的相对路径相对 `cwd` |
 | `url` / `headers` | 仅 streamable-http |
 | `toolCallTimeoutMs` | 每次调用超时，默认 60000 |
-| `failOnStartupError` | 默认 `false` |
+| `failOnStartupError` | 默认 `false`；`true` 时第一次连不上就不再重试（状态「连接失败」），可以用 `/project-config reconnect` 手动重连 |
 | `maxInstructionBytes` | 服务器说明文字上限，默认 32768 |
-| `reconnect` | 断线重连：`enabled`（默认 true）、`initialDelayMs`、`maxDelayMs`、`maxAttempts` |
+| `reconnect` | 自动重连：`enabled`（默认 true）、`initialDelayMs`（默认 500）、`maxDelayMs`（默认 30000）、`maxAttempts`（默认 10）。间隔从 `initialDelayMs` 起每次翻倍，最长 `maxDelayMs`；连续失败 `maxAttempts` 次后放弃，工具移除。连上后稳定超过 `maxDelayMs`，次数重新计算 |
 
 **凭据怎么传（重要）**
 
-- DSH 启动子进程时会去掉名字含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD` 的环境变量。所以即使你本机设了 `GITHUB_TOKEN`，MCP 服务器默认也拿不到
-- 要在 `env` 里显式写 `GITHUB_TOKEN: '${GITHUB_TOKEN}'`，从 DSH 进程的环境变量取值。**不要把 token 明文写进 `settings.yml`**，它通常会被提交到 git
-- `${VAR}` 在 `command`、`args`、`env`、`url`、`headers` 里都可用；变量不存在时，这个服务器跳过，`/project-config` 写明缺哪个变量
-- 改了系统环境变量要重启 DSH 才能读到
+**不要把 token 明文写进 `settings.yml`**，它会被提交到 git。两种方式任选：
 
-**状态**：`/project-config` 显示每个服务器 `已连接 — N 个工具` / `连接失败` / `跳过` 及原因。日志里看到同一服务器启动两次是正常的（DSH 的 MCP 客户端会先起一个探测进程）。
+1. **明文写在 `settings.local.yml`**（推荐个人使用）：在 `settings.local.yml` 里写一条同名的完整条目，覆盖 `settings.yml` 里的那条（见 §7）。别忘了把它加进 `.gitignore`
+
+   ```yaml
+   # .dsh/settings.yml（提交）
+   mcp:
+     - serverName: docs
+       transport: streamable-http
+       url: https://docs.example.com/mcp
+   # .dsh/settings.local.yml（不提交）
+   mcp:
+     - serverName: docs
+       transport: streamable-http
+       url: https://docs.example.com/mcp
+       headers: { Authorization: 'Bearer <你的 token>' }
+   ```
+
+2. **`${VAR}` 从环境变量取值**（适合 CI 或共享机器）：`env: { GITHUB_TOKEN: '${GITHUB_TOKEN}' }`
+   - `${VAR}` 在 `command`、`args`、`env`、`url`、`headers` 里都可用（两个文件里都行）；变量不存在时，这个服务器跳过，`/project-config` 写明缺哪个变量
+   - 改了系统环境变量要重启 DSH 才能读到
+
+另外：
+
+- DSH 启动子进程时会去掉名字含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD` 的环境变量。所以即使你本机设了 `GITHUB_TOKEN`，stdio 的 MCP 服务器默认也拿不到，要在 `env` 里显式写出来
+- `url`、`headers`、`env` 的值不会出现在 `/project-config`、告警和诊断日志里：MCP 报错里出现这些值时会换成 `***`
+
+**状态和重连**
+
+`/project-config` 显示每个服务器当前的连接状态（查看时会先 ping 一下已连接的服务器，所以悄悄挂掉的也能发现）：
+
+| 状态 | 含义 |
+|---|---|
+| `✓ 已连接 — N 个工具` | 正常 |
+| `✗ 连接失败，重试中 — 原因（第 i/n 次重试）` | 还没连上过，正在自动重试 |
+| `⟳ 连接断开，重连中 — 原因（第 i/n 次重试）` | 连上过，后来断了；重连期间工具还在，调用会报错 |
+| `✗ 连接失败 — 原因` | 已放弃自动重试，工具已移除 |
+| `— 跳过 — 原因` | 没有启动（缺环境变量、`cwd` 不合法、`reconnect` 写错） |
+
+原因是 MCP 连接返回的真实错误（如 `HTTP 401`、`fetch failed`）；stdio 服务器还会附上它最后几行 stderr。
+
+**手动重连**（不用重启 DSH，也不用新开会话）：
+
+- `/project-config reconnect`：重连所有没连上的服务器
+- `/project-config reconnect <名字>`：重连这一个，已连上的也会断开重连（比如服务器重启过、换了 token）
+- 立即重连，重试次数清零；命令等这次连接有结果后返回状态
+- 第一次调用模型前只等第一次连接；之后才连上的服务器，工具在下一次调用模型时出现
+
 
 ## 6. `hooks`
 
@@ -243,7 +287,57 @@ process.stdin.on('data', (d) => (s += d)).on('end', () => {
 - Windows 上带引号的程序路径前要加 `&`：`& "C:/Program Files/nodejs/node.exe" .dsh/hooks/guard.mjs`
 - hook 受当前会话的沙箱限制：会话是只读模式时，hook 也写不了文件
 
-## 7. 从 Claude Code 迁移
+## 7. `settings.local.yml`：个人配置
+
+和 `settings.yml` 放在同一个目录（`.dsh/`），放只属于你自己的配置：MCP 凭据、个人的 hooks、自己才用的子代理。**要把它加进 `.gitignore`**（插件不检查它有没有被 git 跟踪）：
+
+```gitignore
+.dsh/settings.local.yml
+```
+
+- **只有 `settings.yml` 存在时才读取**（`settings.yml` 可以是空文件）。只有 `settings.local.yml` 时什么都不加载
+- 写法和 `settings.yml` 完全一样：同样的四个顶层字段、字段规则、路径规则（相对工作区根）、`${VAR}`、1MB 上限
+- 信任规则也一样：命令、MCP、hooks 要工作区已信任，子代理不需要
+- `.dsh` 是链接时，从链接目标里读
+
+### 合并规则
+
+两个文件各自校验，再合并：
+
+| 字段 | 按什么匹配 | 规则 |
+|---|---|---|
+| `subagents` | `toolName` | 同名：local 的整条替换 shared 的，位置不变；新名字：加在末尾 |
+| `commands` | `name` | 同上 |
+| `mcp` | `serverName` | 同上 |
+| `hooks` | 事件名 | 同一事件：shared 的 hook 在前，local 的接在后面（不覆盖） |
+
+- **整条替换，不合并字段**：local 里写了 `- serverName: docs`，就要写全 `transport`、`url`、`headers`，shared 那条的字段一个都不会留下
+- local 里某条写错，只跳过这一条，shared 里的同名条目照常生效
+- local 文件 YAML 写坏了（或顶层不是映射、超过 1MB）：整份 local 忽略，shared 照常生效，`/project-config` 给一条 `⚠`
+
+### `enabled: false`：去掉 shared 里的条目
+
+不想用 shared 里的某个子代理、命令或 MCP 服务器时，在 local 里写同名条目加 `enabled: false`，其他字段不用写：
+
+```yaml
+# .dsh/settings.local.yml
+mcp:
+  - serverName: github
+    enabled: false
+```
+
+- 只在 `settings.local.yml` 里有效。写在 `settings.yml` 里会给 `⚠` 并被忽略，条目照常加载
+- shared 里没有同名条目时给 `⚠`
+- hooks 没有 `enabled`
+
+### 在 `/project-config` 里
+
+- 「配置文件」一行列出两个文件
+- 来自 local 的条目名字后面标 `(local)`，覆盖了 shared 的标 `(local 覆盖)`；hooks 标出其中几个来自 local，如 `tools/pre-execute ×3（local 1）`
+- 被 `enabled: false` 去掉的列在「已移除」一行
+- 告警前面写明来自哪个文件：`settings.local.yml：mcp[0] (docs)：……`
+
+## 8. 从 Claude Code 迁移
 
 本插件只读 `.dsh/settings.yml`，不读 `.claude/` 下的任何配置，需要手动搬：
 
@@ -252,20 +346,24 @@ process.stdin.on('data', (d) => (s += d)).on('end', () => {
 | `.claude/agents/<名字>.md` | `subagents` 条目，`personaFile` 指向原文件即可（frontmatter 会被去掉）；frontmatter 里的 `tools` 不会被读取，要改写成 `toolFilter.allow`，并换成 DSH 工具名 |
 | `.claude/commands/*.md`（提示词模板） | 不支持。这里的命令运行 JS，结果不发给模型；提示词模板可以改成 skill |
 | `.claude/settings.json` 的 `hooks` | `hooks`，事件名按 §6 换；matcher 里的 `Bash` 换成 `pwsh` / `bash`，`Read` 换成 `read` 等 |
-| `.mcp.json` 的 `mcpServers` | `mcp` 列表：键名变成 `serverName`，`type` 变成 `transport`（`http` → `streamable-http`），`env` 里的凭据改成 `${VAR}` |
+| `.mcp.json` 的 `mcpServers` | `mcp` 列表：键名变成 `serverName`，`type` 变成 `transport`（`http` → `streamable-http`）。不含凭据、要提交的放 `settings.yml` |
+| 被 gitignore、含 token 的 `.mcp.json` | `settings.local.yml` 的 `mcp`（凭据可以明文写，见 §7） |
+| `.claude/settings.local.json` | `settings.local.yml`（同样的合并思路，规则见 §7） |
 | `CLAUDE.md` | 原样可用（DSH 读 `AGENTS.md` 和 `CLAUDE.md`） |
 
-## 8. 排查
+## 9. 排查
 
 | 现象 | 看哪里 |
 |---|---|
 | 子代理、命令、MCP 都没出现 | `/project-config`：是否读到了 `settings.yml`、工作区根是不是你以为的那个目录 |
+| `settings.local.yml` 没生效 | 有没有 `settings.yml`（可以是空的）；`/project-config` 的「配置文件」一行有没有列出它；有没有「整份文件已忽略」的 `⚠` |
+| local 覆盖后 MCP 少了字段 | 整条替换，不合并字段：local 那条要写全 |
 | 命令、MCP、hooks 显示「需要信任」 | `/workspace-trust trust` |
 | 子代理启动失败 | 多半是 `toolFilter` 写了不存在的工具名，看报错里列出的可用工具 |
 | 子代理里没有某个工具 | 它的 `allow` 没列出来；MCP 工具要写全名 |
 | 子代理派不出下层子代理 | §3「子代理再派项目子代理」两个条件 |
-| MCP「跳过」 | 缺环境变量，或 `cwd` 不合法 |
-| MCP「连接失败」 | 先在终端里用同样的 `command` / `args` 跑一下 |
+| MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错 |
+| MCP「连接失败」「重试中」 | 看后面的原因；stdio 先在终端里用同样的 `command` / `args` 跑一下。修好后 `/project-config reconnect <名字>` |
 | hook 不触发 | 事件名、matcher 写法；标「—」的事件不能写 matcher |
 | hook 应拦截却没拦 | 退出码必须正好是 2；或 JSON 写在 stdout 且退出码为 0 |
 
