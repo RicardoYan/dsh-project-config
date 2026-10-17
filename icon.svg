@@ -1,0 +1,15 @@
+<svg width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="4" y="4" width="28" height="28" rx="8" fill="url(#pc_indigo)" />
+  <g stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round">
+    <path d="M11 13.5h14" /><path d="M11 18h14" /><path d="M11 22.5h14" />
+  </g>
+  <g fill="#FFFFFF">
+    <circle cx="15" cy="13.5" r="2.1" /><circle cx="21.5" cy="18" r="2.1" /><circle cx="13.5" cy="22.5" r="2.1" />
+  </g>
+  <defs>
+    <linearGradient id="pc_indigo" x1="18" y1="4" x2="18" y2="32" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8E9BFF" />
+      <stop offset="1" stop-color="#4655E0" />
+    </linearGradient>
+  </defs>
+</svg>

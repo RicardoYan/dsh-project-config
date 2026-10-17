@@ -2,13 +2,16 @@
 
 本文是 dsh-project-config 的完整配置参考。快速上手看 [README](../README.md)；写配置、排查问题看这里。
 
+**读者是项目维护者。** 插件只提供机制（读配置、挂载、运行），**不替项目写配置**。
+从别的工具迁过来要自己换算，§8 有对照表和例子。
+
 ## 1. 先看这几条（最常踩的坑）
 
 1. **文件名只认 `.dsh/settings.yml`**，外加个人用的 `.dsh/settings.local.yml`（见 §7）。其他文件名（如 `project-config.yml`）不读取，也不提示
 2. **凭据写在 `settings.local.yml`，并把它加进 `.gitignore`**。`settings.yml` 会提交到 git，不要写 token
 3. **改完配置要新开会话**才生效；当前会话发 `/project-config` 看读到了什么、哪些被跳过、为什么
 4. **写错的字段不会报错**，只在 `/project-config` 里给一条 `⚠`。改完配置先看一眼
-5. **工具名用 DSH 的名字**：`read`、`write`、`edit`、`grep`、`glob`、`pwsh`（Windows）/ `bash`（macOS、Linux），不是 `Read`、`Bash`。`toolFilter` 里写了当前 DSH 不存在的工具名，这个子代理会启动失败
+5. **工具名用 DSH 的名字**：`read`、`write`、`edit`、`grep`、`glob`、`pwsh`（Windows）/ `bash`（macOS、Linux），不是 `Read`、`Bash`。DSH 里不存在这个名字时，`toolFilter` 那条限制会被跳过（`/project-config` 不报，见诊断日志），hooks 的 `matcher` 同理
 6. **命令、MCP、hooks 要工作区已信任才运行**（需要装 [dsh-workspace-trust](https://github.com/RicardoYan/dsh-workspace-trust)），子代理不需要
 7. **`skills` 字段已不支持**：skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读
 8. **hooks 的事件名是 DSH 的**（`tools/pre-execute`），不是 `PreToolUse`；Windows 上 hook 命令由 PowerShell 执行
@@ -38,13 +41,15 @@ hooks: {}       # hooks
 
 每个条目注册一个与 `toolName` 同名的工具，模型调用它就派出一个带指定 persona 的子代理。
 
+子代理**继承主会话的全部工具**（含 MCP 服务器、项目命令带来的工具），persona 由本插件挂在子代理自己的会话作用域上，会盖住主会话预设的 persona。`toolFilter` 用来在这个继承来的工具池里做白/黑名单裁剪，语义与 Claude Code 的 `tools` / `disallowedTools` 一致。
+
 ```yaml
 subagents:
   - toolName: code-reviewer                 # 必填
     personaFile: .dsh/agents/code-reviewer.md   # 必填
     description: 审查代码改动并指出问题      # 可选
-    toolFilter:                             # 可选
-      allow: [read, grep, glob, mcp__github__search_code]
+    toolFilter:                             # 可选，限制子代理能用哪些工具
+      deny: [write, edit]                   # 只读角色：去掉写文件的工具
     maxDepth: 1                             # 可选，默认 1
     backgroundMode: continuable             # 可选，默认 continuable
     provider: spawn                         # 可选，默认 spawn，一般不用改
@@ -55,7 +60,7 @@ subagents:
 | `toolName` | 是 | 小写字母开头，只含 `a-z 0-9 _ -`。不要与 DSH 自带工具同名，否则会把自带工具遮住 |
 | `personaFile` | 是 | persona 文件（Markdown）。开头的 YAML frontmatter 会被去掉，正文作为子代理的系统提示 |
 | `description` | 否 | 用途，显示在主会话的「项目子代理」清单里，模型据此选择。省略时用 persona frontmatter 的 `description` |
-| `toolFilter` | 否 | `allow`（白名单）和/或 `deny`（黑名单），见下 |
+| `toolFilter` | 否 | 从继承来的工具池里裁剪：`allow` 白名单 / `deny` 黑名单。两个都写时都能生效。不写就是全部继承 |
 | `maxDepth` | 否 | 这个子代理**最多能出现在第几层**。主会话直接派出的是第 1 层；默认 1，表示只有主会话能派它 |
 | `backgroundMode` | 否 | `continuable`：默认后台运行，结束时通知主会话，之后还能继续对话；`one-shot`：默认前台运行，等结果 |
 | `provider` | 否 | DSH 的子代理提供方，默认 `spawn`（全新子会话，看不到主会话的对话） |
@@ -73,13 +78,15 @@ description: 审查代码改动并指出问题
 
 - 不写：子代理拥有和主会话一样的工具
 - `allow` 是白名单：**没列出的都没有**。写了 `allow` 却漏掉 `read`，子代理就读不了文件
-- 工具名必须是当前 DSH 里存在的（见 §1 第 5 条）。启动失败时报错 `tools.restrict() names unknown global tool "..."`，后面会列出可用的工具名
+- `deny` 是黑名单：列出的去掉，其余照常继承。只读角色用 `deny: [write, edit]`，比 `allow` 少漏
+- 两个都写时都生效：先按 `allow` 取白名单，再按 `deny` 去黑名单
+- 工具名必须是当前 DSH 里存在的（见 §1 第 5 条）。写错时子代理**照常派得出去**，但这条限制会被跳过并在诊断日志里记一条 `toolFilter not applied: ...`，后面会列出可用的工具名
 - MCP 工具写全名：`mcp__<serverName>__<工具名>`
-- DSH 自带的通用 `subagent` 工具（和 `list_subagent_models`）每个子代理都有，`toolFilter` 管不到，写不写都一样；它能嵌套几层由 DSH 设置里的子代理层数上限决定
+- 项目子代理自己的工具名（`toolName`）和 DSH 每个会话自带的 `subagent` / `list_subagent_models` 不用写进 `toolFilter`：前者由本插件按「再派」规则单独管，后者 `tools.restrict` 管不到
 
 ### 子代理再派项目子代理
 
-两个条件都要满足：
+`toolFilter.allow` 里可以同时写工具名和**下层项目子代理的名字**：工具名交给 `tools.restrict` 裁剪工具池，子代理名交给本插件决定「能不能再派它」。两个条件都要满足：
 
 1. 上层子代理的 `allow` 里写了下层的名字（或不写 `toolFilter`）
 2. 下层子代理的 `maxDepth` ≥ 它所在的层数
@@ -93,6 +100,8 @@ subagents:
     personaFile: .dsh/agents/code-reviewer.md
     maxDepth: 2                                              # 2. planner 派出的 code-reviewer 在第 2 层
 ```
+
+注意 `allow` 同时是工具白名单：上面 planner 的例子写了 `allow`，就只有 `read`、`grep`、`glob` 这三个工具，`pwsh` 会没有。只想限制「能派谁」而工具全都要时，改用 `deny` 列出不想要的下层名字，或者干脆不写 `toolFilter`。
 
 ## 4. `commands`：斜杠命令
 
@@ -349,13 +358,69 @@ mcp:
 
 | Claude Code | 这里 |
 |---|---|
-| `.claude/agents/<名字>.md` | `subagents` 条目，`personaFile` 指向原文件即可（frontmatter 会被去掉）；frontmatter 里的 `tools` 不会被读取，要改写成 `toolFilter.allow`，并换成 DSH 工具名 |
+| `.claude/agents/<名字>.md` | `subagents` 条目，`personaFile` 指向原文件即可（frontmatter 会被去掉）；frontmatter 的 `tools` 写成 `toolFilter.allow`、`disallowedTools` 写成 `toolFilter.deny`，并换成 DSH 工具名。`tools` 省略（=继承全部）时这里也省略 `toolFilter` |
 | `.claude/commands/*.md`（提示词模板） | 不支持。这里的命令运行 JS，结果不发给模型；提示词模板可以改成 skill |
 | `.claude/settings.json` 的 `hooks` | `hooks`，事件名按 §6 换；matcher 里的 `Bash` 换成 `pwsh` / `bash`，`Read` 换成 `read` 等 |
 | `.mcp.json` 的 `mcpServers` | `mcp` 列表：键名变成 `serverName`，`type` 变成 `transport`（`http` → `streamable-http`）。不含凭据、要提交的放 `settings.yml` |
 | 被 gitignore、含 token 的 `.mcp.json` | `settings.local.yml` 的 `mcp`（凭据可以明文写，见 §7） |
 | `.claude/settings.local.json` | `settings.local.yml`（同样的合并思路，规则见 §7） |
 | `CLAUDE.md` | 原样可用（DSH 读 `AGENTS.md` 和 `CLAUDE.md`） |
+
+### 工具名对照（`tools` / `disallowedTools` → `toolFilter`）
+
+Claude Code 用大写开头的工具名，这里一律用小写 DSH 名：
+
+| Claude Code | 这里 | 备注 |
+|---|---|---|
+| `Read` | `read` | |
+| `Write` | `write` | |
+| `Edit` / `MultiEdit` | `edit` | |
+| `Glob` | `glob` | |
+| `Grep` | `grep` | |
+| `Bash` | `pwsh`（Windows）/ `bash`（macOS、Linux） | 平台不同名字不同 |
+| `WebFetch` | `web_fetch` | |
+| `WebSearch` | `web_search` | |
+| `TodoWrite` | `todo_write` | |
+| `Task` / `Agent` | 不写 | 子代理派发由本插件的「再派」规则管（§3） |
+| `mcp__<server>__<tool>` | 同名 | 服务器名按 §5 的 `serverName` |
+
+三个换算示例：
+
+```yaml
+# CC: tools: Read, Grep, Glob          （只读）
+subagents:
+  - toolName: explorer
+    personaFile: .dsh/agents/explorer.md
+    toolFilter: { allow: [read, grep, glob] }
+
+# CC: disallowedTools: Write, Edit     （其余全部继承）
+subagents:
+  - toolName: reviewer
+    personaFile: .dsh/agents/reviewer.md
+    toolFilter: { deny: [write, edit] }
+
+# CC: 不写 tools                        （继承全部，什么都不用写）
+subagents:
+  - toolName: helper
+    personaFile: .dsh/agents/helper.md
+```
+
+**推荐用 `deny`**：`allow` 是白名单，DSH 以后新增的工具它拿不到；`deny` 只去掉不想要的，其余自动跟上。
+另外写成 `allow` 时若漏掉 `read`，子代理就读不了文件——这类问题只会在运行时报「没有工具」，不会在加载时报错。
+
+### frontmatter 里不生效的字段
+
+persona 文件的 frontmatter 只用来提供 `description`（省略配置里的 `description` 时用它）。
+其余字段**都不读**，要自己换算：
+
+| frontmatter | 在这里怎么办 |
+|---|---|
+| `tools` / `disallowedTools` | 换成 `toolFilter`，见上 |
+| `model` | 不生效。子代理继承主会话的模型；要换模型用 DSH 的子代理模型设置 |
+| `permissionMode` | 不生效。权限由会话的权限预设决定 |
+| `skills` | 不生效。skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读 |
+| `mcpServers` | 不生效。服务器写在 `settings.yml` 的 `mcp` 里，对该工作区所有子代理生效 |
+| `hooks` | 不生效。hooks 写在 `settings.yml` 的 `hooks` 里，是工作区级的 |
 
 ## 9. 排查
 
@@ -365,7 +430,8 @@ mcp:
 | `settings.local.yml` 没生效 | 有没有 `settings.yml`（可以是空的）；`/project-config` 的「配置文件」一行有没有列出它；有没有「整份文件已忽略」的 `⚠` |
 | local 覆盖后 MCP 少了字段 | 整条替换，不合并字段：local 那条要写全 |
 | 命令、MCP、hooks 显示「需要信任」 | `/workspace-trust trust` |
-| 子代理启动失败 | 多半是 `toolFilter` 写了不存在的工具名，看报错里列出的可用工具 |
+| 子代理启动失败 | 看会话里的报错；`toolFilter` 写了不存在的工具名**不会**让它启动失败，只会跳过那条限制 |
+| 子代理没有某个工具，或没有 persona | 工具：`deny` 去掉了 / `allow` 没列；persona：`personaFile` 读到了没有（`/project-config`） |
 | 子代理里没有某个工具 | 它的 `allow` 没列出来；MCP 工具要写全名 |
 | 子代理派不出下层子代理 | §3「子代理再派项目子代理」两个条件 |
 | MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错 |

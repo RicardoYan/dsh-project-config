@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "项目配置 (dsh-project-config)",
+    "description": "按工作区从 .dsh/settings.yml 加载子代理、命令、MCP 服务器和 hooks，并叠加个人的 settings.local.yml。"
+  }
+}

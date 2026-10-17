@@ -30,7 +30,7 @@ registerHooks({
 const { parseSettings, expandVars, splitPersona } = await import('../lib/settings.js');
 const { loadProjectSettings: loadSettings, mergeSettings } = await import('../lib/project-settings.js');
 const { builtinFindRoot, builtinCheckTarget, createWorkspace } = await import('../lib/workspace.js');
-const { admits, officialFilter, interceptTools, rosterText } = await import('../lib/features/subagents.js');
+const { admits, applyChildRole, officialFilter, interceptTools, rosterText } = await import('../lib/features/subagents.js');
 const { McpHub, resolveServerConfig } = await import('../lib/features/mcp.js');
 const { mountHooks, validateHookMatchers, forwardExitCode } = await import('../lib/features/hooks.js');
 const { normalizeResult, loadHandler } = await import('../lib/features/commands.js');
@@ -627,7 +627,176 @@ check('officialFilter: inherited subagent_fork kept', officialFilter({ allow: ['
   check('intercept: other methods pass through', t.get('z'), 'got:z');
   check('intercept: tracker hidden', t[Symbol.for('cordis.tracker')], undefined);
 }
+{
+  // The guard that keeps a duplicate registration from killing the host. DSH's
+  // registry throws `tool "<name>" is already registered in this scope`, and the
+  // loader treats that as a fatal load failure. Two sources produce duplicates:
+  // our own mount racing a plugin reload, and dsh-tool-subagent re-installing
+  // its per-agent tool. Both must degrade to a warning instead.
+  const registered = [];
+  const warnings = [];
+  const log = { info() {}, warn: (m) => warnings.push(m), error() {} };
+  const real = {
+    register: (d) => {
+      if (registered.includes(d.name)) throw new Error(`tool "${d.name}" is already registered in this scope`);
+      registered.push(d.name);
+      return () => { registered.splice(registered.indexOf(d.name), 1); };
+    },
+  };
+  const t = interceptTools(real, (d, reg) => reg(d), { log, label: 'L' });
+  t.register({ name: 'subagent' });
+  t.register({ name: 'subagent' });          // second one must not throw
+  check('intercept: duplicate name skipped, first kept', registered, ['subagent']);
+  check('intercept: duplicate reported as a warning', warnings.length, 1);
+  truthy('intercept: warning names the tool', warnings[0].includes('subagent'));
+
+  // A duplicate the wrapper itself forwards into the real registry (its own
+  // `seen` missed it, e.g. the name was registered before this proxy existed).
+  const preUsed = { register: (d) => { throw new Error(`tool "${d.name}" is already registered in this scope`); } };
+  const t2 = interceptTools(preUsed, (d, reg) => reg(d), { log, label: 'L' });
+  let threw = false;
+  try { t2.register({ name: 'subagent_fork' }); } catch { threw = true; }
+  check('intercept: registry duplicate swallowed', threw, false);
+  truthy('intercept: registry duplicate reported', warnings.length === 2 && warnings[1].includes('subagent_fork'));
+
+  // Any other registration error still propagates: this guard is not a blanket.
+  const broken = { register: () => { throw new Error('something else broke'); } };
+  const t3 = interceptTools(broken, (d, reg) => reg(d), { log, label: 'L' });
+  let otherThrew = '';
+  try { t3.register({ name: 'x' }); } catch (error) { otherThrew = String(error?.message ?? error); }
+  check('intercept: unrelated errors propagate', otherThrew, 'something else broke');
+
+  // After a successful dispose the name is free again.
+  const reReg = [];
+  const reusable = {
+    register: (d) => { reReg.push(d.name); return () => {}; },
+  };
+  const t4 = interceptTools(reusable, (d, reg) => reg(d), { log, label: 'L' });
+  const d1 = t4.register({ name: 'y' });
+  d1();
+  t4.register({ name: 'y' });
+  check('intercept: name reusable after dispose', reReg, ['y', 'y']);
+
+  // Without a logger there is nowhere to report, so the duplicate surfaces as
+  // DSH's own error rather than being silently swallowed.
+  const t5 = interceptTools({ register: () => () => {} }, (d, reg) => reg(d));
+  t5.register({ name: 'z' });
+  let noLogger = '';
+  try { t5.register({ name: 'z' }); } catch (error) { noLogger = String(error?.message ?? error); }
+  truthy('intercept: no logger -> duplicate still reported', noLogger.includes('z') && noLogger.includes('already registered'));
+}
 truthy('roster: lists names', rosterText([{ entry: { toolName: 'doc' }, description: 'docs' }]).includes('`doc`: docs'));
+
+// ---------------------------------------------------------------- subagent role (DSH 0.2.1)
+// `tool-subagent` rejects `persona` and `toolFilter` on 0.2.1. A delegation tool is
+// therefore installed WITHOUT `agentPreset`: the child joins the parent's retained
+// composition (inheriting every tool and MCP client), and its role is applied on the
+// child's own scope — a `deployment:persona-prefix` section plus `tools.restrict`.
+{
+  /** A child context fake recording what applyChildRole registers on it. */
+  function fakeChild() {
+    const sections = [];
+    const restricts = [];
+    const warnings = [];
+    const ctx = {
+      inject: (deps, cb) => {
+        cb({
+          systemPrompt: {
+            getSectionOrder: (name) => (name === 'DEPLOYMENT_PERSONA_PREFIX' ? 0 : 10200),
+            section: (s) => { sections.push(s); return () => {}; },
+          },
+          tools: {
+            restrict: (filter) => {
+              // Mirrors the real service: unknown names are rejected outright.
+              for (const name of [...(filter.allow ?? []), ...(filter.deny ?? [])]) {
+                if (name === 'no_such_tool') throw new Error(`tools.restrict() names unknown global tool "${name}"`);
+              }
+              restricts.push(filter);
+              return () => {};
+            },
+          },
+        });
+        return { dispose: () => {} };
+      },
+    };
+    return { ctx, sections, restricts, warnings };
+  }
+  const log = { info() {}, warn: (m) => {}, error() {} };
+
+  // Persona + filter: both land on the child scope, with the official section name.
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, { persona: 'You review code.', filter: { deny: ['write'] } }, {
+      log, label: 't', isProjectName: () => false,
+    });
+    check('role: persona uses the official section name', c.sections.map((s) => s.name), ['deployment:persona-prefix']);
+    check('role: persona uses DEPLOYMENT_PERSONA_PREFIX order (shadows the preset)',
+      c.sections[0].order, 0);
+    check('role: persona text is the project persona', c.sections[0].text, 'You review code.');
+    check('role: toolFilter reaches tools.restrict', c.restricts, [{ deny: ['write'] }]);
+  }
+
+  // No filter: the child keeps every inherited tool.
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, { persona: 'p' }, { log, label: 't', isProjectName: () => false });
+    check('role: no toolFilter -> no restriction', c.restricts.length, 0);
+  }
+
+  // No persona (empty string): no section, but the filter still applies.
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, { persona: '', filter: { allow: ['read'] } }, { log, label: 't', isProjectName: () => false });
+    check('role: empty persona -> no section', c.sections.length, 0);
+    check('role: filter still applied', c.restricts, [{ allow: ['read'] }]);
+  }
+
+  // A name this plugin owns (another project subagent) must not reach restrict:
+  // that tool is registered per child by us, so the global registry rejects it.
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, { persona: 'p', filter: { allow: ['read', 'code-reviewer', 'mcp__gh__issue'] } }, {
+      log, label: 't', isProjectName: (n) => n === 'code-reviewer',
+    });
+    check('role: project names stripped from the filter', c.restricts, [{ allow: ['read', 'mcp__gh__issue'] }]);
+  }
+
+  // The per-agent delegation tools are stripped too (DSH registers them itself).
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, { persona: 'p', filter: { deny: ['subagent', 'list_subagent_models', 'pwsh'] } }, {
+      log, label: 't', isProjectName: () => false,
+    });
+    check('role: per-agent tools stripped from the filter', c.restricts, [{ deny: ['pwsh'] }]);
+  }
+
+  // A filter that strips to nothing must not call restrict({}), which throws.
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, { persona: 'p', filter: { deny: ['subagent'] } }, { log, label: 't', isProjectName: () => false });
+    check('role: filter stripping to empty is skipped', c.restricts.length, 0);
+  }
+
+  // An unknown tool name is reported, not thrown: one bad name must not cost the
+  // whole child its persona (the persona is registered before the filter).
+  {
+    const c = fakeChild();
+    const warned = [];
+    applyChildRole(c.ctx, { persona: 'p', filter: { allow: ['no_such_tool'] } }, {
+      log: { info() {}, warn: (m) => warned.push(m), error() {} }, label: 't', isProjectName: () => false,
+    });
+    check('role: persona survives a bad tool name', c.sections.length, 1);
+    check('role: bad tool name is logged', warned.length, 1);
+    truthy('role: warning names the tool', warned[0].includes('unknown global tool'));
+  }
+
+  // Undefined spec (a child that is not a project subagent) is a no-op.
+  {
+    const c = fakeChild();
+    applyChildRole(c.ctx, undefined, { log, label: 't', isProjectName: () => false });
+    check('role: non-project child untouched', [c.sections.length, c.restricts.length], [0, 0]);
+  }
+}
 
 // ---------------------------------------------------------------- MCP config + hub mirror
 {

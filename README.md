@@ -7,8 +7,8 @@ DSH 自带的只读取项目里的 `AGENTS.md` 和 `.dsh/skills/`；子代理、
 ## 安装
 
 ```sh
-dsh plugin --profile desktop add github:RicardoYan/dsh-workspace-trust#v0.1.0
-dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.1.1
+dsh plugin --profile desktop add github:RicardoYan/dsh-workspace-trust#v0.2.0
+dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.2.0
 ```
 
 Web 端把 `desktop` 换成你的 profile 名（一般是 `web`）。装完重启 DSH。
@@ -57,7 +57,7 @@ hooks:
 
 ## 注意
 
-- 依赖 DSH 内部接口（agent 事件、`dsh-tool-subagent`、`dsh-mcp-client` 的工具定义、DSH 自带的 MCP SDK `@modelcontextprotocol/client`、`dsh-hook-protocol`、`dsh-skill-filesystem`、`dsh-agent-instructions`），适用于 `@deepseek-ai/dsh` `>=0.2.0-rc.2 <0.3.0-0`
+- 依赖 DSH 内部接口（agent 事件、`dsh-tool-subagent`、`dsh-mcp-client` 的工具定义、DSH 自带的 MCP SDK `@modelcontextprotocol/client`、`dsh-hook-protocol`、`dsh-skill-filesystem`、`dsh-agent-instructions`），适用于 `@deepseek-ai/dsh` `>=0.2.1-rc.1 <0.3.0-0`
 - 装上或卸下本插件后，已有会话继续时会多收到一份完整的 AGENTS.md（只一次）
 - 改了 `settings.yml` 或 `settings.local.yml`，新开的会话生效
 - hooks 的 `command` 由 DSH 的 shell 执行：Windows 上是 PowerShell，带引号的程序路径前要加 `&`，如 `& "C:/Program Files/nodejs/node.exe" check.mjs`
