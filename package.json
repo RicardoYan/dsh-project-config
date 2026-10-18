@@ -89,7 +89,7 @@
     "@deepseek-ai/dsh-subprocess": ">=0.2.1-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-tool-subagent": ">=0.2.1-rc.1 <0.3.0-0",
     "@modelcontextprotocol/client": ">=2.0.0 <3.0.0",
-    "dsh-workspace-trust": ">=0.1.0 <0.2.0"
+    "dsh-workspace-trust": ">=0.2.0 <0.3.0"
   },
   "peerDependenciesMeta": {
     "dsh-workspace-trust": {
