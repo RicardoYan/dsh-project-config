@@ -1,0 +1,186 @@
+// Keep a `.dsh/settings.yml` workspace from inheriting an outer git root's
+// project skills and AGENTS.md. Both patches only change behavior for sessions
+// whose workspace root actually holds `.dsh/settings.yml`.
+//
+// Official interfaces relied on:
+// - @deepseek-ai/dsh-skill-filesystem: `FileSystemSkillProvider.prototype.roots(cwd)`
+//   returns project roots tagged `project-dsh` / `project-agents` with a `projectRoot`.
+// - @deepseek-ai/dsh-agent-instructions: config field `projectRootMarkers`
+//   (child names, first match wins while walking up).
+// - cordis: global `internal/config` waterfall runs when a fiber resolves its config;
+//   `fiber.restart()` re-resolves it.
+import fs from 'node:fs'
+import path from 'node:path'
+import type { Context, Fiber } from '@deepseek-ai/cordis'
+import { apply as instructionsApply } from '@deepseek-ai/dsh-agent-instructions'
+import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
+import { builtinFindRoot } from './workspace.js'
+
+export const MARKER = '.dsh/settings.yml'
+const PATCHED = Symbol.for('dsh-project-config/skill-roots')
+const isWin = process.platform === 'win32'
+const keyOf = (p: string): string => (isWin ? path.resolve(p).toLowerCase() : path.resolve(p))
+
+/** The log surface isolation writes through. */
+interface IsolationLog {
+  warn(message: string): void
+  info(message: string): void
+}
+
+async function realOrResolved(p: string): Promise<string> {
+  try {
+    return await fs.promises.realpath(p)
+  } catch {
+    return path.resolve(p)
+  }
+}
+
+async function settingsRoot(cwd: string): Promise<string | undefined> {
+  const root = await builtinFindRoot(cwd)
+  try {
+    if ((await fs.promises.stat(path.join(root, '.dsh', 'settings.yml'))).isFile()) return root
+  } catch {
+    /* none */
+  }
+  return undefined
+}
+
+/** A skill root as `FileSystemSkillProvider.roots()` returns one. */
+export interface SkillRoot {
+  source?: string
+  path?: string
+  projectRoot?: string
+  [key: string]: unknown
+}
+
+/** Rewrite project skill roots to the settings.yml workspace root. Exported for tests. */
+export async function rewriteRoots(
+  roots: SkillRoot[],
+  cwd: string | undefined,
+): Promise<SkillRoot[]> {
+  if (cwd === undefined) return roots
+  const project = roots.find((r) => r.source === 'project-dsh' || r.source === 'project-agents')
+  if (project === undefined) return roots
+  const root = await settingsRoot(cwd)
+  if (root === undefined) return roots
+  if (keyOf(await realOrResolved(project.projectRoot ?? '')) === keyOf(root)) return roots
+  return roots.map((r) => {
+    if (r.source === 'project-dsh') {
+      return { ...r, path: path.join(root, '.dsh', 'skills'), projectRoot: root }
+    }
+    if (r.source === 'project-agents') {
+      return { ...r, path: path.join(root, '.agents', 'skills'), projectRoot: root }
+    }
+    return r
+  })
+}
+
+/** The provider prototype as this module patches it. */
+interface SkillProviderProto {
+  roots?(cwd: string): Promise<SkillRoot[]>
+  [key: symbol]: unknown
+}
+
+export function patchSkillRoots(log: IsolationLog): () => void {
+  const proto = (FileSystemSkillProvider as unknown as { prototype?: SkillProviderProto } | undefined)
+    ?.prototype
+  if (typeof proto?.roots !== 'function') {
+    log.warn('dsh-skill-filesystem roots() missing; skills isolation disabled')
+    return () => {}
+  }
+  if (proto[PATCHED] === true) return () => {}
+  const original = proto.roots
+  const patched = async function (this: unknown, cwd: string): Promise<SkillRoot[]> {
+    const result = await original.call(this, cwd)
+    try {
+      return await rewriteRoots(result, cwd)
+    } catch (error) {
+      log.warn(`skills isolation failed for ${cwd}: ${errorMessage(error)}`)
+      return result
+    }
+  } as SkillProviderProto['roots'] & { [key: symbol]: unknown }
+  patched[PATCHED] = true
+  proto.roots = patched
+  proto[PATCHED] = true
+  return () => {
+    if (proto.roots === patched) proto.roots = original
+    delete proto[PATCHED]
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return String((error as { message?: unknown } | undefined)?.message ?? error)
+}
+
+/** The agent-instructions config this plugin edits. */
+interface InstructionsConfig {
+  projectRootMarkers?: unknown
+  [key: string]: unknown
+}
+
+/** Instances keyed by plugin callback, as `ctx.registry.get` returns them. */
+interface InstructionsRuntime {
+  fibers: Iterable<Fiber>
+}
+
+/** Insert the marker into agent-instructions config and restart loaded instances. */
+export function installInstructionsMarker(ctx: Context, log: IsolationLog): void {
+  if (typeof instructionsApply !== 'function') {
+    log.warn('dsh-agent-instructions apply missing; AGENTS.md isolation disabled')
+    return
+  }
+  let active = true
+  ctx.on(
+    'internal/config',
+    function (this: Fiber, config: unknown, next: () => unknown) {
+      const out = next()
+      if (!active || this?.runtime?.callback !== instructionsApply || out === null || typeof out !== 'object') {
+        return out
+      }
+      const target = out as InstructionsConfig
+      const markers = Array.isArray(target.projectRootMarkers)
+        ? (target.projectRootMarkers as unknown[])
+        : ['.git']
+      if (markers.includes(MARKER)) return out
+      return { ...target, projectRootMarkers: [MARKER, ...markers] }
+    },
+    { global: true },
+  )
+
+  const restartAll = async (reason: string): Promise<void> => {
+    const runtime = ctx.registry.get(instructionsApply) as InstructionsRuntime | undefined
+    const fibers = runtime !== undefined ? [...runtime.fibers] : []
+    let restarted = 0
+    for (const fiber of fibers) {
+      if (fiber.uid === null) continue
+      try {
+        await fiber.restart()
+        restarted++
+      } catch (error) {
+        log.warn(`agent-instructions restart failed (${reason}): ${errorMessage(error)}`)
+      }
+    }
+    if (restarted > 0) log.info(`agent-instructions restarted (${reason}): ${restarted}`)
+  }
+
+  // Presets are usually mounted before this plugin; restart once the tree settles.
+  ctx.inject(['loader'], (c) => {
+    // `Loader.await()` waits for pending import/lifecycle tasks. It exists at
+    // runtime (`cordis-plugin-loader`'s Loader class) but is absent from the
+    // shipped declaration file, so the call is narrowed here rather than cast.
+    const loader = (c as unknown as { loader: { await(): Promise<void> } }).loader
+    void loader.await().then(
+      () => restartAll('install'),
+      () => restartAll('install'),
+    )
+  })
+  ctx.effect(
+    () => () => {
+      active = false
+      setTimeout(() => {
+        void restartAll('uninstall').catch(() => {})
+      }, 0)
+    },
+    'project-config: instructions marker',
+  )
+}

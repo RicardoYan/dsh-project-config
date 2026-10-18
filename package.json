@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-config",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Per-workspace subagents, commands, MCP servers and hooks for DSH from .dsh/settings.yml (+ personal settings.local.yml) · 从 .dsh/settings.yml（及个人的 settings.local.yml）为 DSH 工作区加载子代理、命令、MCP 和 hooks",
   "type": "module",
@@ -47,7 +47,29 @@
     "dsh": ">=0.2.1-rc.1 <0.3.0-0"
   },
   "scripts": {
-    "test": "node test/selftest.mjs"
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "npm run build && node test/selftest.mjs"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent-instructions": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-hook-protocol": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-mcp-client": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-skill-filesystem": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-subprocess": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-tool-subagent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-user-questions": "0.2.1-rc.2",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/node": "^26.2.0",
+    "typescript": "^6.0.3",
+    "yaml": "^2.3.0"
   },
   "dsh": {
     "bundle": {
@@ -60,13 +82,13 @@
   },
   "peerDependencies": {
     "@deepseek-ai/dsh": ">=0.2.1-rc.1 <0.3.0-0",
-    "@deepseek-ai/dsh-tool-subagent": ">=0.2.1-rc.1 <0.3.0-0",
-    "@deepseek-ai/dsh-mcp-client": ">=0.2.1-rc.1 <0.3.0-0",
-    "@deepseek-ai/dsh-subprocess": ">=0.2.1-rc.1 <0.3.0-0",
-    "@modelcontextprotocol/client": ">=2.0.0 <3.0.0",
-    "@deepseek-ai/dsh-skill-filesystem": ">=0.2.1-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-agent-instructions": ">=0.2.1-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-llm": ">=0.2.1-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-mcp-client": ">=0.2.1-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-skill-filesystem": ">=0.2.1-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-subprocess": ">=0.2.1-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tool-subagent": ">=0.2.1-rc.1 <0.3.0-0",
+    "@modelcontextprotocol/client": ">=2.0.0 <3.0.0",
     "dsh-workspace-trust": ">=0.1.0 <0.2.0"
   },
   "peerDependenciesMeta": {

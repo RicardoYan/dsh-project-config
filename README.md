@@ -7,8 +7,8 @@ DSH 自带的只读取项目里的 `AGENTS.md` 和 `.dsh/skills/`；子代理、
 ## 安装
 
 ```sh
-dsh plugin --profile desktop add github:RicardoYan/dsh-workspace-trust#v0.2.0
-dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.2.0
+dsh plugin --profile desktop add github:RicardoYan/dsh-workspace-trust#v0.2.1
+dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.2.1
 ```
 
 Web 端把 `desktop` 换成你的 profile 名（一般是 `web`）。装完重启 DSH。
