@@ -6,7 +6,6 @@
 // does not own). These interfaces are the single description of both, so the
 // `reference.js` `index.ts` commands, the lifecycle hooks and the status report
 // all agree on what a mount carries.
-import type { WorkspaceFacade } from './workspace.js'
 import type { Settings, SubagentSpec, Removal } from './settings.js'
 import type { HookStats } from './features/hooks.js'
 import type { McpHub } from './features/mcp.js'
@@ -59,25 +58,19 @@ export interface RootMount {
   ok: boolean
   error: Text | undefined
   warnings: Text[]
-  gatedWarnings: Text[]
   settings: Settings
   origin: Record<string, Map<string, 'local' | 'override'> | undefined>
   hooksLocal: Record<string, number> | undefined
   removed: Removal[] | undefined
-  trust: string
   subagentSpecs: LoadedSpec[]
-  deferredSpecs: SubagentSpec[]
-  trustedSpecs: LoadedSpec[] | undefined
   subagentNames: Set<string>
   children: Set<ChildMount>
   fibers: Array<FeatureMount>
-  gated: Array<FeatureMount>
+  /** Commands, MCP and hooks; mounted once, after the settings are read. */
+  features: Array<FeatureMount>
   listeners: Unsubscribe[]
   hub: McpHub | undefined
-  gatedOn: boolean
-  gatedReady: Promise<void> | undefined
-  /** Bumped on every gated remount, so in-flight work can detect it went stale. */
-  gen: number
+  featuresMounted: boolean
   prepared: boolean
   stats: Stats
   released?: boolean
@@ -91,9 +84,10 @@ export interface ChildMount {
   toolName: string | undefined
   filter: { allow?: string[]; deny?: string[] } | undefined
   fibers: Array<FeatureMount>
-  gated: Array<FeatureMount>
+  /** MCP mirror and hooks, mounted once the root's features are up. */
+  features: Array<FeatureMount>
   subagents: Array<{ entry: SubagentSpec; persona: string; description: string | undefined }>
-  gatedOn?: boolean
+  featuresMounted?: boolean
   released?: boolean
 }
 
@@ -106,9 +100,4 @@ export interface FeatureOptions {
   label: string
   isProjectName?: (name: string) => boolean
   sectionName?: string
-}
-
-/** Services `apply` reaches for through `ctx`. */
-export interface MountContext {
-  ws: WorkspaceFacade
 }

@@ -29,7 +29,7 @@ registerHooks({
 
 const { parseSettings, expandVars, splitPersona } = await import('../lib/settings.js');
 const { loadProjectSettings: loadSettings, mergeSettings } = await import('../lib/project-settings.js');
-const { builtinFindRoot, builtinCheckTarget, createWorkspace } = await import('../lib/workspace.js');
+const { findRoot, checkTarget } = await import('../lib/workspace.js');
 const { admits, applyChildRole, officialFilter, interceptTools, rosterText } = await import('../lib/features/subagents.js');
 const { McpHub, resolveServerConfig } = await import('../lib/features/mcp.js');
 const { mountHooks, validateHookMatchers, forwardExitCode } = await import('../lib/features/hooks.js');
@@ -191,29 +191,23 @@ check('persona: frontmatter stripped', splitPersona('---\nname: a\ndescription: 
 check('persona: no frontmatter', splitPersona('  just body  '), { body: 'just body', description: undefined });
 check('persona: CRLF', splitPersona('---\r\ndescription: d\r\n---\r\nB'), { body: 'B', description: 'd' });
 
-// ---------------------------------------------------------------- workspace (builtin, restricted)
+// ---------------------------------------------------------------- workspace
 const gitRoot = mk('repo'); mk('repo', '.git');
 const sub = mk('repo', 'pkg'); write(path.join(sub, '.dsh', 'settings.yml'), 'subagents: []');
 const deep = mk('repo', 'pkg', 'src', 'x');
 const outside = mk('outside'); write(path.join(outside, 'p.md'), 'p');
 write(path.join(sub, 'inside.md'), 'i');
 fs.symlinkSync(outside, path.join(sub, 'link-out'), 'junction');
-check('root: settings.yml nearer', await builtinFindRoot(deep), sub);
-check('root: git', await builtinFindRoot(path.join(gitRoot)), gitRoot);
-check('check: inside ok', (await builtinCheckTarget(sub, 'inside.md', { type: 'file' })).ok, true);
-check('check: outside via junction refused', (await builtinCheckTarget(sub, 'link-out/p.md')).code, 'UNTRUSTED');
-check('check: escape', (await builtinCheckTarget(sub, '../x')).code, 'BAD_PATH');
-check('check: absolute', (await builtinCheckTarget(sub, outside)).code, 'BAD_PATH');
-check('check: missing', (await builtinCheckTarget(sub, 'nope')).code, 'NOT_FOUND');
-check('check: type', (await builtinCheckTarget(sub, 'inside.md', { type: 'directory' })).code, 'WRONG_TYPE');
-{
-  const noTrust = createWorkspace(() => undefined);
-  check('ws: no trust -> untrusted', [noTrust.hasTrust(), noTrust.state(sub), await noTrust.ensure({}, sub)], [false, 'untrusted', 'untrusted']);
-  const calls = [];
-  const fake = { findRoot: async () => 'R', state: () => 'unknown', ensure: async (o) => { calls.push(o.root); return 'trusted'; }, checkTarget: async () => ({ ok: true, realPath: 'X' }) };
-  const withTrust = createWorkspace(() => fake);
-  check('ws: delegates', [withTrust.hasTrust(), await withTrust.findRoot('c'), withTrust.state('R'), await withTrust.ensure({}, 'R'), (await withTrust.checkTarget('R', 'a')).realPath, calls], [true, 'R', 'unknown', 'trusted', 'X', ['R']]);
-}
+check('root: settings.yml nearer', await findRoot(deep), sub);
+check('root: git', await findRoot(path.join(gitRoot)), gitRoot);
+check('check: inside ok', (await checkTarget(sub, 'inside.md', { type: 'file' })).ok, true);
+check('check: outside via junction allowed', (await checkTarget(sub, 'link-out/p.md')).ok, true);
+check('check: outside via junction keeps real path', (await checkTarget(sub, 'link-out/p.md')).realPath, fs.realpathSync.native(path.join(outside, 'p.md')));
+check('check: ../ resolves against the root', (await checkTarget(sub, '../pkg/inside.md')).ok, true);
+check('check: absolute path works', (await checkTarget(sub, outside)).ok, true);
+check('check: missing', (await checkTarget(sub, 'nope')).code, 'NOT_FOUND');
+check('check: type', (await checkTarget(sub, 'inside.md', { type: 'directory' })).code, 'WRONG_TYPE');
+check('check: too large', (await checkTarget(sub, 'inside.md', { maxBytes: 0 })).code, 'TOO_LARGE');
 {
   const loaded = await loadSettings(sub);
   check('load: found', [loaded.ok, loaded.file], [true, path.join(sub, '.dsh', 'settings.yml')]);
@@ -361,33 +355,31 @@ hooks:
   check('merge: empty local no-op', [noop.settings, noop.removed, noop.warnings], [base, [], []]);
 
   // /project-config marks, both languages
-  const m = { root: tmp, file: both.file, localFile: both.localFile, ok: true, trust: 'untrusted', warnings: [], gatedWarnings: [],
-    subagentSpecs: S.subagents.map((entry) => ({ entry })), deferredSpecs: [], settings: S, origin: both.origin, hooksLocal: both.hooksLocal, removed: both.removed, stats: { runs: 0, failures: 0 } };
-  const zh = inLang('zh', () => statusText(m, { hasTrust: true, logFile: 'L' })).split('\n');
-  const en = inLang('en', () => statusText(m, { hasTrust: true, logFile: 'L' })).split('\n');
+  const m = { root: tmp, file: both.file, localFile: both.localFile, ok: true, warnings: [],
+    subagentSpecs: S.subagents.map((entry) => ({ entry })), settings: S, origin: both.origin, hooksLocal: both.hooksLocal, removed: both.removed, stats: { runs: 0, failures: 0 } };
+  const zh = inLang('zh', () => statusText(m, { logFile: 'L' })).split('\n');
+  const en = inLang('en', () => statusText(m, { logFile: 'L' })).split('\n');
   check('status local: zh', zh.slice(1), [
     `配置文件：${both.file} + ${both.localFile}`,
-    '信任：不信任',
     '子代理：a (local 覆盖), b, z (local)',
-    '命令（需要信任）：/c1 (local 覆盖), /c2, /c9 (local)',
-    'MCP（需要信任）：s2 (local 覆盖), s3, s4 (local)',
-    'Hooks（需要信任）：tools/pre-execute ×3（local 1）, agent/pre-step ×1, tools/post-execute ×1（local 1）',
+    '命令：/c1 (local 覆盖), /c2, /c9 (local)',
+    'MCP：s2 (local 覆盖), s3, s4 (local)',
+    'Hooks：tools/pre-execute ×3（local 1）, agent/pre-step ×1, tools/post-execute ×1（local 1）（已运行 0 次，失败 0 次）',
     '已移除（local enabled: false）：MCP s1',
     '日志：L',
   ]);
   check('status local: en', en.slice(1), [
     `Settings: ${both.file} + ${both.localFile}`,
-    'Trust: Not trusted',
     'Subagents: a (local override), b, z (local)',
-    'Commands (requires trust): /c1 (local override), /c2, /c9 (local)',
-    'MCP (requires trust): s2 (local override), s3, s4 (local)',
-    'Hooks (requires trust): tools/pre-execute ×3 (local 1), agent/pre-step ×1, tools/post-execute ×1 (local 1)',
+    'Commands: /c1 (local override), /c2, /c9 (local)',
+    'MCP: s2 (local override), s3, s4 (local)',
+    'Hooks: tools/pre-execute ×3 (local 1), agent/pre-step ×1, tools/post-execute ×1 (local 1) (runs 0, failures 0)',
     'Removed (local enabled: false): MCP s1',
     'Log: L',
   ]);
   check('status local: en has no chinese', CJK.test(en.join('\n')), false);
-  const connected = { ...m, trust: 'trusted', hub: { summary: () => [{ name: 's2', status: 'connected', detail: TEXT.tools(2) }] } };
-  truthy('status local: connected server marked', inLang('zh', () => statusText(connected, { hasTrust: true, logFile: 'L' })).includes('MCP s2 (local 覆盖)：✓ 已连接 — 2 个工具'));
+  const connected = { ...m, hub: { summary: () => [{ name: 's2', status: 'connected', detail: TEXT.tools(2) }] } };
+  truthy('status local: connected server marked', inLang('zh', () => statusText(connected, { logFile: 'L' })).includes('MCP s2 (local 覆盖)：✓ 已连接 — 2 个工具'));
 }
 
 // ---------------------------------------------------------------- secrets stay out of logs and status
@@ -414,8 +406,8 @@ hooks:
     { transportFactory: (config) => { seenConfig = config; return fake.transportFactory(config); }, clientFactory: fake.clientFactory });
   check('secrets: connection got real values', [seenConfig.headers.Authorization, seenConfig.url.endsWith(`${SECRET}q`)], [`Bearer ${SECRET}`, true]);
   const summary = hub.summary();
-  const status = inLang('en', () => statusText({ root: tmp, file: 'F', ok: true, trust: 'trusted', warnings: [], gatedWarnings: [], subagentSpecs: [], deferredSpecs: [],
-    settings: { subagents: [], commands: [], mcp: [entry], hooks: {} }, hub, stats: { runs: 0, failures: 0 } }, { hasTrust: true, logFile }));
+  const status = inLang('en', () => statusText({ root: tmp, file: 'F', ok: true, warnings: [], subagentSpecs: [],
+    settings: { subagents: [], commands: [], mcp: [entry], hooks: {} }, hub, stats: { runs: 0, failures: 0 } }, { logFile }));
   const logText = fs.readFileSync(logFile, 'utf8');
   check('secrets: server failed', summary[0].status, 'failed');
   truthy('secrets: something was logged', logText.length > 0);
@@ -583,21 +575,41 @@ hooks:
   check('hub: reconnect all when all up -> nothing', await hub.reconnect(), []);
   check('hub: reconnect connected one by name', await hub.reconnect('a'), ['a']);
   check('hub: unknown name', await hub.reconnect('zz'), undefined);
-  check('hub: skipped server cannot reconnect', await hub.reconnect('c'), []);
+  // a skipped server has no connection: reconnect must say so, not pretend it worked
+  let skipErr;
+  try { await hub.reconnect('c'); } catch (e) { skipErr = e; }
+  check('hub: skipped server raises SkippedServer', [skipErr?.name, skipErr?.server, skipErr?.reason], ['SkippedServer', 'c', 'cwd: bad']);
+  check('hub: skipped list', hub.skippedServers(), [{ name: 'c', reason: 'cwd: bad' }]);
   // reconnect output, both languages
   const root = { hub, origin: { mcp: new Map([['b', 'local']]) } };
   check('reconnect text', [inLang('zh', () => reconnectText(root, ['b'])), inLang('en', () => reconnectText(root, ['b']))],
     ['MCP b (local)：✓ 已连接 — 1 个工具', 'MCP b (local): ✓ connected — 1 tool']);
+  // the two new messages, one language at a time, reason included
+  check('reconnect skipped text', [
+    inLang('zh', () => `${TEXT.reconnectSkipped('c', 'cwd: bad')}`),
+    inLang('en', () => `${TEXT.reconnectSkipped('c', 'cwd: bad')}`),
+  ], [
+    'MCP 服务器 c 在挂载时就被跳过了，重连无法恢复（cwd: bad）；请修好配置后新开会话',
+    'MCP server c was skipped while mounting and cannot be reconnected (cwd: bad); fix the config, then start a new session',
+  ]);
+  check('reconnect all skipped text', [
+    inLang('zh', () => `${TEXT.reconnectAllSkipped('c (cwd: bad)')}`),
+    inLang('en', () => `${TEXT.reconnectAllSkipped('c (cwd: bad)')}`),
+  ], [
+    '没有可重连的服务器；以下服务器在挂载时就被跳过了，修好配置后新开会话才会生效：c (cwd: bad)',
+    'Nothing to reconnect; these servers were skipped while mounting, so a settings fix takes effect in a new session: c (cwd: bad)',
+  ]);
+  check('reconnect skipped: en has no chinese', CJK.test(inLang('en', () => `${TEXT.reconnectSkipped('c', 'x')} ${TEXT.reconnectAllSkipped('c')}`)), false);
   await hub.disposeAll();
   check('hub: disposeAll stops connections', hub.summary().map((x) => x.status), ['stopped', 'stopped', 'skipped']);
 
   check('mcp state: zh labels', inLang('zh', () => [`${TEXT.mcpState.retrying}`, `${TEXT.mcpState.reconnecting}`, `${TEXT.mcpRetry('X', { n: 2, max: 10 })}`, `${TEXT.tools(1)}`]),
     ['✗ 连接失败，重试中', '⟳ 连接断开，重连中', 'X（第 2/10 次重试）', '1 个工具']);
   check('mcp state: en plural', inLang('en', () => [`${TEXT.tools(0)}`, `${TEXT.tools(1)}`, `${TEXT.tools(2)}`]), ['0 tools', '1 tool', '2 tools']);
-  const m = { root: tmp, file: 'F', ok: true, trust: 'trusted', warnings: [], gatedWarnings: [], subagentSpecs: [], deferredSpecs: [], settings: { subagents: [], commands: [], mcp: [{ serverName: 'k' }], hooks: {} }, stats: { runs: 0, failures: 0 },
+  const m = { root: tmp, file: 'F', ok: true, warnings: [], subagentSpecs: [], settings: { subagents: [], commands: [], mcp: [{ serverName: 'k' }], hooks: {} }, stats: { runs: 0, failures: 0 },
     hub: { summary: () => [{ name: 'k', status: 'retrying', detail: TEXT.mcpRetry('HTTP 401', { n: 1, max: 10 }) }] } };
-  truthy('mcp state: status line en', inLang('en', () => statusText(m, { hasTrust: true, logFile: 'L' })).includes('MCP k: ✗ failed, retrying — HTTP 401 (retry 1/10)'));
-  truthy('mcp state: status line zh', inLang('zh', () => statusText(m, { hasTrust: true, logFile: 'L' })).includes('MCP k：✗ 连接失败，重试中 — HTTP 401（第 1/10 次重试）'));
+  truthy('mcp state: status line en', inLang('en', () => statusText(m, { logFile: 'L' })).includes('MCP k: ✗ failed, retrying — HTTP 401 (retry 1/10)'));
+  truthy('mcp state: status line zh', inLang('zh', () => statusText(m, { logFile: 'L' })).includes('MCP k：✗ 连接失败，重试中 — HTTP 401（第 1/10 次重试）'));
 }
 {
   const { DEFAULT_LOG_FILE } = await import('../lib/log.js');
@@ -800,16 +812,18 @@ truthy('roster: lists names', rosterText([{ entry: { toolName: 'doc' }, descript
 
 // ---------------------------------------------------------------- MCP config + hub mirror
 {
-  const checkTarget = (root, rel) => builtinCheckTarget(root, rel, { type: 'directory' });
+  const dirTarget = (root, rel) => checkTarget(root, rel, { type: 'directory' });
   mk('repo', 'pkg', 'tools');
-  const r1 = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', args: ['${A}'], env: { T: '${B}' } }, sub, checkTarget, { A: 'x', B: 'y' });
+  const r1 = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', args: ['${A}'], env: { T: '${B}' } }, sub, dirTarget, { A: 'x', B: 'y' });
   check('mcp cfg: stdio expanded, cwd root', r1.config, { serverName: 's', transport: 'stdio', command: 'node', args: ['x'], env: { T: 'y' }, cwd: sub });
-  const r2 = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', cwd: 'tools' }, sub, checkTarget, {});
+  const r2 = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', cwd: 'tools' }, sub, dirTarget, {});
   check('mcp cfg: cwd resolved', r2.config.cwd, path.join(sub, 'tools'));
-  const r3 = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', cwd: 'link-out' }, sub, checkTarget, {});
-  truthy('mcp cfg: cwd outside refused', inLang('en', () => String(r3.error)).startsWith('cwd: Path is outside'));
-  truthy('mcp cfg: cwd outside refused (zh)', inLang('zh', () => String(r3.error)).startsWith('cwd：路径在工作区外'));
-  const r4 = await resolveServerConfig({ serverName: 'w', transport: 'streamable-http', url: 'http://h/${P}', headers: { A: 'Bearer ${TOK}' } }, sub, checkTarget, {});
+  const r3 = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', cwd: 'link-out' }, sub, dirTarget, {});
+  check('mcp cfg: cwd outside allowed', r3.config?.cwd, fs.realpathSync.native(outside));
+  const r3b = await resolveServerConfig({ serverName: 's', transport: 'stdio', command: 'node', cwd: 'nope' }, sub, dirTarget, {});
+  truthy('mcp cfg: cwd missing refused', inLang('en', () => String(r3b.error)).startsWith('cwd: Path not found'));
+  truthy('mcp cfg: cwd missing refused (zh)', inLang('zh', () => String(r3b.error)).startsWith('cwd：路径不存在'));
+  const r4 = await resolveServerConfig({ serverName: 'w', transport: 'streamable-http', url: 'http://h/${P}', headers: { A: 'Bearer ${TOK}' } }, sub, dirTarget, {});
   check('mcp cfg: missing vars listed', [inLang('zh', () => `${r4.error}`), inLang('en', () => `${r4.error}`)], ['环境变量未设置：P, TOK', 'environment variable not set: P, TOK']);
 
   const hub = new McpHub(quietLog, 't');
@@ -967,33 +981,33 @@ check('result: object', normalizeResult({ a: 1 }).text, '{\n  "a": 1\n}');
 
 // ---------------------------------------------------------------- status
 {
-  check('status: no mount', statusText(undefined, { hasTrust: true, logFile: 'L' }).includes('.dsh/settings.yml'), true);
-  const m = { root: sub, file: 'F', ok: true, trust: 'untrusted', warnings: ['w1'], gatedWarnings: [], subagentSpecs: [{ entry: { toolName: 'doc' } }], deferredSpecs: [],
+  check('status: no mount', statusText(undefined, { logFile: 'L' }).includes('.dsh/settings.yml'), true);
+  const m = { root: sub, file: 'F', ok: true, warnings: ['w1'], subagentSpecs: [{ entry: { toolName: 'doc' } }],
     settings: { commands: [{ name: 'hi' }], mcp: [{ serverName: 's' }], hooks: { 'tools/pre-execute': [{}] } }, stats: { runs: 0, failures: 0 } };
-  const t = statusText(m, { hasTrust: false, logFile: 'L' });
-  for (const needle of ['doc', '/hi', 'MCP（需要信任', 'tools/pre-execute ×1', '未安装 dsh-workspace-trust', '⚠ w1']) truthy(`status: ${needle}`, t.includes(needle));
+  const t = statusText(m, { logFile: 'L' });
+  for (const needle of ['doc', '/hi', 'MCP：s', 'tools/pre-execute ×1', '⚠ w1']) truthy(`status: ${needle}`, t.includes(needle));
   // one language at a time, including warnings stored earlier
   const parsed = parseSettings('subagents: [{ toolName: x }]\nskills: []\n');
-  const m2 = { ...m, warnings: parsed.warnings, settings: { ...m.settings }, trust: 'trusted', hub: { summary: () => [{ name: 's', status: 'connected', detail: TEXT.tools(3) }] } };
-  const zh = inLang('zh', () => statusText(m2, { hasTrust: true, logFile: 'L' }));
-  const en = inLang('en', () => statusText(m2, { hasTrust: true, logFile: 'L' }));
-  check('status: zh lines', zh.split('\n').slice(0, 3), [`工作区：${sub}`, '配置文件：F', '信任：已信任']);
-  check('status: en lines', en.split('\n').slice(0, 3), [`Workspace: ${sub}`, 'Settings: F', 'Trust: Trusted']);
+  const m2 = { ...m, warnings: parsed.warnings, settings: { ...m.settings }, hub: { summary: () => [{ name: 's', status: 'connected', detail: TEXT.tools(3) }] } };
+  const zh = inLang('zh', () => statusText(m2, { logFile: 'L' }));
+  const en = inLang('en', () => statusText(m2, { logFile: 'L' }));
+  check('status: zh lines', zh.split('\n').slice(0, 2), [`工作区：${sub}`, '配置文件：F']);
+  check('status: en lines', en.split('\n').slice(0, 2), [`Workspace: ${sub}`, 'Settings: F']);
   truthy('status: zh mcp', zh.includes('MCP s：✓ 已连接 — 3 个工具'));
   truthy('status: en mcp', en.includes('MCP s: ✓ connected — 3 tools'));
   check('status: en has no chinese', CJK.test(en), false);
   // config keys such as `tools/pre-execute` stay as written
-  check('status: zh has no english sentences', /\b(Workspace|Settings|Trust|Subagents|Commands|connected|tools|skipped|ignored|must)\b/.test(zh.replace(/[a-z]+\/[a-z-]+/g, '')), false);
+  check('status: zh has no english sentences', /\b(Workspace|Settings|Subagents|Commands|connected|tools|skipped|ignored|must)\b/.test(zh.replace(/[a-z]+\/[a-z-]+/g, '')), false);
   // a nested message built while zh is active, shown later in en (and back)
-  const nested = inLang('zh', () => TEXT.cwdProblem(TEXT.outsideNoTrust('X')));
+  const nested = inLang('zh', () => TEXT.cwdProblem(TEXT.notFound('X')));
   check('status: nested message follows language', [inLang('en', () => `${nested}`), inLang('zh', () => `${nested}`)],
-    ['cwd: Path is outside the workspace; not allowed without dsh-workspace-trust: X', 'cwd：路径在工作区外，未安装 dsh-workspace-trust 时不允许：X']);
-  check('status: no-mount text per language', [inLang('zh', () => statusText(undefined, { hasTrust: true, logFile: 'L' })).startsWith('此会话'), inLang('en', () => statusText(undefined, { hasTrust: true, logFile: 'L' })).startsWith('No project')], [true, true]);
-  // builtin path messages per language
-  const missingZh = await builtinCheckTarget(sub, 'nope');
-  check('builtin: message per language', [inLang('zh', () => `${missingZh.message}`), inLang('en', () => `${missingZh.message}`)], ['路径不存在：nope', 'Path not found: nope']);
-  const esc = await builtinCheckTarget(sub, '../x');
-  check('builtin: bad path per language', [inLang('zh', () => `${esc.message}`), inLang('en', () => `${esc.message}`)], ['路径写法不允许：../x（跳出了工作区）', 'Path not allowed: ../x (escapes the workspace)']);
+    ['cwd: Path not found: X', 'cwd：路径不存在：X']);
+  check('status: no-mount text per language', [inLang('zh', () => statusText(undefined, { logFile: 'L' })).startsWith('此会话'), inLang('en', () => statusText(undefined, { logFile: 'L' })).startsWith('No project')], [true, true]);
+  // path messages per language
+  const missingZh = await checkTarget(sub, 'nope');
+  check('path: message per language', [inLang('zh', () => `${missingZh.message}`), inLang('en', () => `${missingZh.message}`)], ['路径不存在：nope', 'Path not found: nope']);
+  const wrong = await checkTarget(sub, 'inside.md', { type: 'directory' });
+  check('path: type per language', [inLang('zh', () => `${wrong.message}`), inLang('en', () => `${wrong.message}`)], ['路径类型不符：inside.md', 'Wrong path type: inside.md']);
 }
 
 // ---------------------------------------------------------------- language source wiring
@@ -1028,7 +1042,6 @@ check('result: object', normalizeResult({ a: 1 }).text, '{\n  "a": 1\n}');
   const sessions = new Map();
   root.provide('agents', { list: () => [...agents.values()], get: (id) => agents.get(id) });
   root.provide('sessions', { get: (id) => sessions.get(id) });
-  root.provide('workspaceTrust', { state: () => 'trusted', checkTarget: (r, rel, o) => builtinCheckTarget(r, rel, o) });
   // one agent: its own scope with its own tool table (a duplicate name throws, as in DSH)
   const makeAgent = (id) => {
     const tools = new Map();

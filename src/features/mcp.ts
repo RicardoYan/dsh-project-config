@@ -61,6 +61,19 @@ interface ServerRecord {
   skipped: string | undefined
 }
 
+/** Raised when `reconnect` is asked for a server whose config was rejected. */
+export class SkippedServer extends Error {
+  readonly server: string
+  readonly reason: string | undefined
+
+  constructor(server: string, reason: string | undefined) {
+    super(`MCP server ${server} was skipped while mounting: ${reason ?? 'config rejected'}`)
+    this.name = 'SkippedServer'
+    this.server = server
+    this.reason = reason
+  }
+}
+
 /** A live tool mirrored into a subagent scope. */
 interface MirrorRecord {
   definition: ToolDefinition
@@ -271,13 +284,16 @@ export class McpHub {
   /**
    * Reconnect one server (any state) or, without a name, every server that is not connected.
    * @returns the names reconnected, or undefined when `name` is unknown.
+   * @throws when a target was never connected because its config was rejected;
+   *   such a server needs a settings fix and a new session, not a reconnect.
    */
   async reconnect(name: string | undefined): Promise<string[] | undefined> {
     let targets: McpConnection[]
     if (name !== undefined) {
       const record = this.servers.get(name)
       if (record === undefined) return undefined
-      targets = record.connection !== undefined ? [record.connection] : []
+      if (record.connection === undefined) throw new SkippedServer(name, record.skipped)
+      targets = [record.connection]
     } else {
       targets = [...this.servers.values()]
         .map((r) => r.connection)
@@ -285,6 +301,17 @@ export class McpHub {
     }
     await Promise.allSettled(targets.map((x) => x.reconnect()))
     return targets.map((x) => x.name)
+  }
+
+  /**
+   * Servers that have no connection because their config was rejected while
+   * mounting. They stay skipped for the life of the session: reconnect cannot
+   * revive them, only a settings fix and a new session can.
+   */
+  skippedServers(): Array<{ name: string; reason: string | undefined }> {
+    return [...this.servers.entries()]
+      .filter(([, r]) => r.connection === undefined)
+      .map(([name, r]) => ({ name, reason: r.skipped }))
   }
 
   async disposeAll(): Promise<void> {

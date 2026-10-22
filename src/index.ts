@@ -3,9 +3,8 @@
  * from `<workspace>/.dsh/settings.yml`, merged with the personal
  * `.dsh/settings.local.yml` when present (see project-settings.ts).
  *
- * Trust comes from dsh-workspace-trust (`ctx.workspaceTrust`, optional). Without
- * it every workspace is treated as untrusted: subagents and isolation still work;
- * commands, MCP and hooks never run.
+ * Everything a workspace configures is loaded and run as soon as a session
+ * starts there; nothing asks first.
  *
  * DSH interfaces relied on (@deepseek-ai/dsh 0.2.x):
  * - `agent/created` (serial, scoped carrier) / `agent/disposed` / `agent/pre-step`
@@ -22,12 +21,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { createLog, type Log } from './log.js'
-import { createWorkspace, type WorkspaceFacade } from './workspace.js'
+import { findRoot, checkTarget } from './workspace.js'
 import { splitPersona, type McpSpec } from './settings.js'
 import { loadProjectSettings } from './project-settings.js'
 import { patchSkillRoots, installInstructionsMarker } from './isolation.js'
 import { admits, applyChildRole, delegationStore, mountSubagentTools } from './features/subagents.js'
-import { McpHub, resolveServerConfig } from './features/mcp.js'
+import { McpHub, resolveServerConfig, SkippedServer } from './features/mcp.js'
 import { mountHooks, runLifecycleHook } from './features/hooks.js'
 import { mountCommands } from './features/commands.js'
 import { reconnectText, statusText } from './status.js'
@@ -125,26 +124,10 @@ interface AgentCreatedEvent {
   source: string
 }
 
-/** The `workspace-trust/changed` payload. */
-interface TrustChangedEvent {
-  root?: string
-  state: string
-}
-
-/** Services the plugin reaches for by name. */
-interface TrustRaised extends WorkspaceFacade {}
-
-declare module '@deepseek-ai/cordis' {
-  interface Events {
-    'workspace-trust/changed'(payload: TrustChangedEvent): void
-  }
-}
-
 export function apply(ctx: Context): void {
   setLocaleSource(() => preferenceFromLoader(ctx.get('loader') as never))
   ctx.effect(() => () => setLocaleSource(undefined), 'project-config: locale')
   const log = createLog(undefined, ctx.logger)
-  const ws = createWorkspace(() => ctx.get('workspaceTrust') as never)
   // agent -> RootMount | ChildMount (or the claim slot while the mount is built)
   const mounts = new WeakMap<AgentLike, Mount | Claim>()
   const roots = new Set<RootMount>()
@@ -177,14 +160,12 @@ export function apply(ctx: Context): void {
   async function loadSpecs(
     m: RootMount,
     entries: ReadonlyArray<import('./settings.js').SubagentSpec>,
-  ): Promise<{ ok: LoadedSpec[]; deferred: import('./settings.js').SubagentSpec[] }> {
+  ): Promise<LoadedSpec[]> {
     const ok: LoadedSpec[] = []
-    const deferred: import('./settings.js').SubagentSpec[] = []
     for (const entry of entries) {
-      const checked = await ws.checkTarget(m.root, entry.personaFile, { type: 'file', maxBytes: PERSONA_MAX })
+      const checked = await checkTarget(m.root, entry.personaFile, { type: 'file', maxBytes: PERSONA_MAX })
       if (!checked.ok) {
-        if (checked.code === 'UNTRUSTED') deferred.push(entry)
-        else m.warnings.push(TEXT.subagentProblem(entry.toolName, checked.message) as Text)
+        m.warnings.push(TEXT.subagentProblem(entry.toolName, checked.message) as Text)
         continue
       }
       try {
@@ -194,7 +175,7 @@ export function apply(ctx: Context): void {
         m.warnings.push(TEXT.subagentProblem(entry.toolName, errMessage(error)) as Text)
       }
     }
-    return { ok, deferred }
+    return ok
   }
 
   const isProjectNameFor = (m: RootMount): ((n: string) => boolean) => (n) =>
@@ -211,7 +192,7 @@ export function apply(ctx: Context): void {
   async function createRootMount(agent: AgentLike, claim: Claim): Promise<RootMount | undefined> {
     const cwd = agent.session.header.cwd
     if (typeof cwd !== 'string') return undefined
-    const root = await ws.findRoot(cwd)
+    const root = await findRoot(cwd)
     const loaded = await loadProjectSettings(root)
     if (loaded === undefined) return undefined
     const label = `[${path.basename(root)}:${agent.id.slice(-8)}]`
@@ -224,24 +205,18 @@ export function apply(ctx: Context): void {
       ok: loaded.ok,
       error: loaded.error,
       warnings: [...(loaded.warnings ?? [])],
-      gatedWarnings: [],
       settings: loaded.settings,
       origin: loaded.origin,
       hooksLocal: loaded.hooksLocal,
       removed: loaded.removed,
-      trust: ws.state(root),
       subagentSpecs: [],
-      deferredSpecs: [],
-      trustedSpecs: undefined,
       subagentNames: new Set(),
       children: new Set(),
       fibers: claim.fibers,
-      gated: [],
+      features: [],
       listeners: [],
       hub: undefined,
-      gatedOn: false,
-      gatedReady: undefined,
-      gen: 0,
+      featuresMounted: false,
       prepared: false,
       stats: { runs: 0, failures: 0 },
     }
@@ -252,10 +227,9 @@ export function apply(ctx: Context): void {
       return m
     }
     m.subagentNames = new Set(m.settings.subagents.map((s) => s.toolName))
-    const { ok, deferred } = await loadSpecs(m, m.settings.subagents)
+    const ok = await loadSpecs(m, m.settings.subagents)
     if (claim.released) return m
     m.subagentSpecs = ok
-    m.deferredSpecs = deferred
     m.fibers.push(
       mountSubagentTools(agent.ctx, ok, {
         log,
@@ -266,7 +240,7 @@ export function apply(ctx: Context): void {
     )
     for (const w of m.warnings) log.warn(`${label}: ${w}`)
     log.info(
-      `${label}: loaded ${loaded.file}${loaded.localFile ? ` + ${path.basename(loaded.localFile)}` : ''} (subagents ${ok.length}, commands ${m.settings.commands.length}, mcp ${m.settings.mcp.length}, hook events ${Object.keys(m.settings.hooks).length}), trust ${m.trust}`,
+      `${label}: loaded ${loaded.file}${loaded.localFile ? ` + ${path.basename(loaded.localFile)}` : ''} (subagents ${ok.length}, commands ${m.settings.commands.length}, mcp ${m.settings.mcp.length}, hook events ${Object.keys(m.settings.hooks).length})`,
     )
     return m
   }
@@ -275,85 +249,51 @@ export function apply(ctx: Context): void {
     return { hooks: m.settings.hooks, root: m.root, log, label: m.label, stats: m.stats }
   }
 
-  function mountGated(m: RootMount): Promise<void> {
+  function mountFeatures(m: RootMount): Promise<void> {
     if (!active || m.released === true || !m.ok) return Promise.resolve()
-    if (m.gatedOn) return m.gatedReady ?? Promise.resolve()
-    m.gatedOn = true
-    m.gatedReady = doMountGated(m).catch((error: unknown) =>
+    if (m.featuresMounted) return Promise.resolve()
+    m.featuresMounted = true
+    return doMountFeatures(m).catch((error: unknown) =>
       log.error(`${m.label}: mount failed: ${(error as { stack?: unknown } | undefined)?.stack ?? error}`),
     )
-    return m.gatedReady
   }
 
-  async function doMountGated(m: RootMount): Promise<void> {
-    const gen = ++m.gen
-    m.gatedWarnings = []
+  async function doMountFeatures(m: RootMount): Promise<void> {
     const created: Array<FeatureMount> = []
-    const stale = (): boolean => gen !== m.gen
-
-    // subagents whose persona lives outside the workspace
-    if (m.deferredSpecs.length > 0) {
-      const { ok } = await loadSpecs(m, m.deferredSpecs)
-      if (stale()) return
-      m.trustedSpecs = ok
-      created.push(
-        mountSubagentTools((m.agent as AgentLike).ctx, ok, {
-          log,
-          label: m.label,
-          isProjectName: isProjectNameFor(m),
-          sectionName: 'project-config:subagents-trusted',
-        }),
-      )
-    }
+    const agentCtx = (m.agent as { ctx: Context }).ctx
     // commands
     const cmdSpecs: Array<{ entry: import('./settings.js').CommandSpec; realPath: string }> = []
     for (const entry of m.settings.commands) {
-      const checked = await ws.checkTarget(m.root, entry.handlerFile, { type: 'file' })
+      const checked = await checkTarget(m.root, entry.handlerFile, { type: 'file' })
       if (checked.ok) cmdSpecs.push({ entry, realPath: checked.realPath })
-      else m.gatedWarnings.push(TEXT.commandProblem(entry.name, checked.message) as Text)
+      else m.warnings.push(TEXT.commandProblem(entry.name, checked.message) as Text)
     }
-    if (stale()) {
-      created.forEach((f) => void disposeFiber(f, log))
-      return
-    }
-    const agentCtx = (m.agent as { ctx: Context }).ctx
     created.push(mountCommands(agentCtx, cmdSpecs, { root: m.root, log, label: m.label }))
     // MCP
     if (m.settings.mcp.length > 0) {
       m.hub = new McpHub(log, m.label)
       created.push(
         m.hub.start(agentCtx, m.settings.mcp, (entry: McpSpec) =>
-          resolveServerConfig(entry, m.root, ws.checkTarget),
+          resolveServerConfig(entry, m.root, checkTarget),
         ),
       )
     }
     // hooks
     created.push(mountHooks(agentCtx, hookOpts(m)))
-    m.gated.push(...created)
-    for (const w of m.gatedWarnings) log.warn(`${m.label}: ${w}`)
-    for (const child of m.children) mountChildGated(child)
-    log.info(`${m.label}: trusted features mounted`)
+    m.features.push(...created)
+    for (const w of m.warnings) log.warn(`${m.label}: ${w}`)
+    for (const child of m.children) mountChildFeatures(child)
+    log.info(`${m.label}: features mounted`)
   }
 
-  function unmountGated(m: RootMount): Promise<unknown> {
-    if (!m.gatedOn) return Promise.resolve()
-    m.gatedOn = false
-    m.gatedReady = undefined
-    m.gen++
-    const pending: Array<Promise<unknown>> = m.gated.splice(0).map((f) => disposeFiber(f, log))
+  function unmountFeatures(m: RootMount): Promise<unknown> {
+    if (!m.featuresMounted) return Promise.resolve()
+    m.featuresMounted = false
+    const pending: Array<Promise<unknown>> = m.features.splice(0).map((f) => disposeFiber(f, log))
     m.hub = undefined
-    m.trustedSpecs = undefined
-    m.gatedWarnings = []
-    for (const child of m.children) pending.push(unmountChildGated(child))
-    log.info(`${m.label}: trusted features removed`)
+    for (const child of m.children) pending.push(unmountChildFeatures(child))
+    log.info(`${m.label}: features removed`)
     return Promise.all(pending)
-  }
-
-  async function setTrust(m: RootMount, state: string): Promise<void> {
-    if (m.released === true) return
-    m.trust = state
-    if (state === 'trusted') await mountGated(m)
-    else void unmountGated(m)
   }
 
   // ------------------------------------------------------------ child sessions
@@ -376,7 +316,7 @@ export function apply(ctx: Context): void {
     if (known !== undefined) return known
     const persona = descriptorPersona(agent)
     if (persona !== undefined) {
-      const spec = [...rootMount.subagentSpecs, ...(rootMount.trustedSpecs ?? [])].find((s) => s.persona === persona)
+      const spec = rootMount.subagentSpecs.find((s) => s.persona === persona)
       if (spec !== undefined) return spec.entry.toolName
     }
     return undefined
@@ -386,7 +326,7 @@ export function apply(ctx: Context): void {
     const depth = child.agent && (child.agent as AgentLike).session.header.delegationDepth !== undefined
       ? ((child.agent as AgentLike).session.header.delegationDepth as number)
       : 0
-    const all = [...rootMount.subagentSpecs, ...(rootMount.trustedSpecs ?? [])]
+    const all = rootMount.subagentSpecs
     return all
       .filter((s) => admits(child.filter, s.entry.toolName) && depth + 1 <= s.entry.maxDepth)
       .map((s) => ({ entry: s.entry, persona: s.persona, description: s.description }))
@@ -413,7 +353,7 @@ export function apply(ctx: Context): void {
       toolName,
       filter: entry?.toolFilter,
       fibers: [],
-      gated: [],
+      features: [],
       subagents: [],
     }
     child.subagents = childSpecsFor(rootMount, child)
@@ -431,7 +371,7 @@ export function apply(ctx: Context): void {
     const spec =
       toolName === undefined
         ? undefined
-        : [...rootMount.subagentSpecs, ...(rootMount.trustedSpecs ?? [])].find(
+        : rootMount.subagentSpecs.find(
             (s) => s.entry.toolName === toolName,
           )
     if (spec !== undefined) {
@@ -444,23 +384,22 @@ export function apply(ctx: Context): void {
       )
     }
     rootMount.children.add(child)
-    if (rootMount.gatedOn) mountChildGated(child)
+    if (rootMount.featuresMounted) mountChildFeatures(child)
     return child
   }
 
-  function mountChildGated(child: ChildMount): void {
-    if (child.gatedOn === true) return
-    child.gatedOn = true
+  function mountChildFeatures(child: ChildMount): void {
+    if (child.featuresMounted === true) return
+    child.featuresMounted = true
     const m = child.rootMount
-    if (m.hub !== undefined) child.gated.push(m.hub.mirror((child.agent as AgentLike).ctx, child.filter))
-    child.gated.push(mountHooks((child.agent as AgentLike).ctx, hookOpts(m)))
-
+    if (m.hub !== undefined) child.features.push(m.hub.mirror((child.agent as AgentLike).ctx, child.filter))
+    child.features.push(mountHooks((child.agent as AgentLike).ctx, hookOpts(m)))
   }
 
-  function unmountChildGated(child: ChildMount): Promise<unknown> {
-    if (child.gatedOn !== true) return Promise.resolve()
-    child.gatedOn = false
-    return Promise.all(child.gated.splice(0).map((f) => disposeFiber(f, log)))
+  function unmountChildFeatures(child: ChildMount): Promise<unknown> {
+    if (child.featuresMounted !== true) return Promise.resolve()
+    child.featuresMounted = false
+    return Promise.all(child.features.splice(0).map((f) => disposeFiber(f, log)))
   }
 
   // ------------------------------------------------------------ release
@@ -471,7 +410,7 @@ export function apply(ctx: Context): void {
     child.released = true
     if (mounts.get(child.agent as AgentLike) === child) mounts.delete(child.agent as AgentLike)
     child.rootMount.children.delete(child)
-    const pending: Array<Promise<unknown>> = [unmountChildGated(child)]
+    const pending: Array<Promise<unknown>> = [unmountChildFeatures(child)]
     for (const f of child.fibers.splice(0)) pending.push(disposeFiber(f, log))
     return Promise.all(pending)
   }
@@ -481,10 +420,10 @@ export function apply(ctx: Context): void {
     m.released = true
     if (mounts.get(m.agent as AgentLike) === m) mounts.delete(m.agent as AgentLike)
     roots.delete(m)
-    // A claim released before its mount existed has no gated features, no
-    // listeners and no hub; `fibers` is shared with the mount being built, so
-    // whatever it already pushed is disposed here.
-    const pending: Array<Promise<unknown>> = [unmountGated(m)]
+    // A claim released before its mount existed has no features, no listeners
+    // and no hub; `fibers` is shared with the mount being built, so whatever it
+    // already pushed is disposed here.
+    const pending: Array<Promise<unknown>> = [unmountFeatures(m)]
     for (const f of m.fibers.splice(0)) pending.push(disposeFiber(f, log))
     for (const off of (m.listeners ?? []).splice(0)) {
       try {
@@ -519,9 +458,7 @@ export function apply(ctx: Context): void {
       const child = createChildMount(agent)
       if (child !== undefined) {
         mounts.set(agent, child)
-        if (child.rootMount.trust === 'trusted') {
-          runLifecycleHook(ctx, hookOpts(child.rootMount), 'agent/created', agent as never, { source }).catch(() => {})
-        }
+        runLifecycleHook(ctx, hookOpts(child.rootMount), 'agent/created', agent as never, { source }).catch(() => {})
       }
       return
     }
@@ -549,11 +486,9 @@ export function apply(ctx: Context): void {
       return
     }
     if (m.ok) installFirstAssembly(m)
-    if (m.trust === 'trusted') {
-      await mountGated(m)
-      if (m.released === true) return
-      runLifecycleHook(ctx, hookOpts(m), 'agent/created', agent as never, { source }).catch(() => {})
-    }
+    await mountFeatures(m)
+    if (m.released === true) return
+    runLifecycleHook(ctx, hookOpts(m), 'agent/created', agent as never, { source }).catch(() => {})
   }
 
   // Awaited on purpose: `agent/created` is serial, and the mount must exist
@@ -572,7 +507,7 @@ export function apply(ctx: Context): void {
     const withRoot = m as { rootMount?: RootMount }
     if (withRoot.rootMount === undefined) {
       const root = m as RootMount
-      if (root.trust === 'trusted' && root.settings.hooks['agent/disposed'] !== undefined) {
+      if (root.settings.hooks['agent/disposed'] !== undefined) {
         runLifecycleHook(ctx, hookOpts(root), 'agent/disposed', agent as never).catch(() => {})
       }
     }
@@ -594,11 +529,11 @@ export function apply(ctx: Context): void {
     void release(m as Mount)
   }) as never)
 
-  // Before the first model call: wait for the trust choice, then for MCP servers.
+  // Before the first model call: wait for the MCP servers.
   // The agent loop assembles prompt + tools *before* `agent/pre-step`
   // (dsh-agent-loop preStep), so the wait happens in the root agent's
   // `system-prompt/assemble` waterfall, which then re-assembles once so the
-  // first request already carries the trusted tools. `agent/pre-step` stays as
+  // first request already carries the MCP tools. `agent/pre-step` stays as
   // a fallback for compositions without that waterfall.
   function installFirstAssembly(m: RootMount): void {
     let reentrant = false
@@ -622,7 +557,7 @@ export function apply(ctx: Context): void {
   }
 
   // Awaited on purpose: this is a waterfall, and the first step must wait for
-  // the trust choice and the MCP servers before the loop assembles its tools.
+  // the MCP servers before the loop assembles its tools.
   ctx.on('agent/pre-step', (async (ev: PreStepEvent, next: () => unknown) => {
     const m = mounts.get(ev.agent)
     if (m !== undefined) {
@@ -638,27 +573,15 @@ export function apply(ctx: Context): void {
   async function prepareRoot(m: RootMount, agent: AgentLike, signal: AbortSignal | undefined): Promise<void> {
     if (m.prepared) return
     m.prepared = true
+    void agent
+    void signal
     try {
-      if (m.trust === 'unknown' && ws.hasTrust()) {
-        const state = await ws.ensure(agent, m.root, signal)
-        if (state !== m.trust) await setTrust(m, state)
-      }
-      if (m.gatedReady !== undefined) await m.gatedReady
+      await mountFeatures(m)
       if (m.hub !== undefined) await m.hub.ready
     } catch (error) {
       log.warn(`${m.label}: first-step preparation failed: ${errMessage(error)}`)
     }
   }
-
-  ctx.on('workspace-trust/changed', ((event: TrustChangedEvent) => {
-    const key = ws.keyOf(event?.root ?? '')
-    for (const m of roots) {
-      if (ws.keyOf(m.root) !== key) continue
-      setTrust(m, event.state).catch((error: unknown) =>
-        log.warn(`${m.label}: trust change failed: ${errMessage(error)}`),
-      )
-    }
-  }) as never)
 
   // /project-config            status (connected MCP servers are pinged first)
   // /project-config reconnect  reconnect every MCP server that is not connected
@@ -674,8 +597,7 @@ export function apply(ctx: Context): void {
       .trim()
       .split(/\s+/)
       .filter(Boolean)
-    const status = (): string =>
-      statusText(mount as never, { hasTrust: ws.hasTrust(), logFile: log.file })
+    const status = (): string => statusText(mount as never, { logFile: log.file })
     if (args.length === 0) {
       if (root?.hub !== undefined) await withTimeout(root.hub.checkAll(), 6000)
       return { kind: 'success', text: status() }
@@ -683,20 +605,33 @@ export function apply(ctx: Context): void {
     if (args[0] !== 'reconnect' || args.length > 2) return { kind: 'error', text: String(TEXT.commandUsage) }
     if (mount === undefined) return { kind: 'error', text: String(TEXT.noSettings) }
     if (root?.hub === undefined) {
-      return {
-        kind: 'error',
-        text: String(root?.trust === 'trusted' ? TEXT.reconnectNoMcp : TEXT.reconnectUntrusted),
-      }
+      return { kind: 'error', text: String(TEXT.reconnectNoMcp) }
     }
     const hub = root.hub
-    const done = await hub.reconnect(args[1] as string)
+    let done: string[] | undefined
+    try {
+      done = await hub.reconnect(args[1] as string)
+    } catch (error) {
+      if (!(error instanceof SkippedServer)) throw error
+      log.warn(`${root.label}: ${error.message}`)
+      return { kind: 'error', text: String(TEXT.reconnectSkipped(error.server, error.reason)) }
+    }
     if (done === undefined) {
       return {
         kind: 'error',
         text: String(TEXT.reconnectUnknown(args[1] as string, [...hub.servers.keys()].join(', '))),
       }
     }
-    if (done.length === 0) return { kind: 'success', text: String(TEXT.reconnectNothing) }
+    if (done.length === 0) {
+      // Nothing was reconnected. When the only servers that are not connected
+      // were skipped at mount time, "everything is connected" would be a lie.
+      const skipped = hub.skippedServers()
+      if (skipped.length > 0) {
+        const list = skipped.map((s) => `${s.name} (${s.reason ?? '—'})`).join(', ')
+        return { kind: 'error', text: String(TEXT.reconnectAllSkipped(list)) }
+      }
+      return { kind: 'success', text: String(TEXT.reconnectNothing) }
+    }
     log.info(`${root.label}: reconnect ${done.join(', ')}`)
     return { kind: 'success', text: reconnectText(root as never, done) }
   }

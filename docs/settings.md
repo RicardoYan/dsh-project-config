@@ -12,7 +12,7 @@
 3. **改完配置要新开会话**才生效；当前会话发 `/project-config` 看读到了什么、哪些被跳过、为什么
 4. **写错的字段不会报错**，只在 `/project-config` 里给一条 `⚠`。改完配置先看一眼
 5. **工具名用 DSH 的名字**：`read`、`write`、`edit`、`grep`、`glob`、`pwsh`（Windows）/ `bash`（macOS、Linux），不是 `Read`、`Bash`。DSH 里不存在这个名字时，`toolFilter` 那条限制会被跳过（`/project-config` 不报，见诊断日志），hooks 的 `matcher` 同理
-6. **命令、MCP、hooks 要工作区已信任才运行**（需要装 [dsh-workspace-trust](https://github.com/RicardoYan/dsh-workspace-trust)），子代理不需要
+6. **命令、MCP、hooks 只要配置了就会运行**，不额外询问；只在该工作区的会话里生效
 7. **`skills` 字段已不支持**：skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读
 8. **hooks 的事件名是 DSH 的**（`tools/pre-execute`），不是 `PreToolUse`；Windows 上 hook 命令由 PowerShell 执行
 
@@ -20,9 +20,9 @@
 
 - 工作区根：从会话目录往上，最近的一个含 `.dsh/settings.yml` 或 `.git` 的目录；都没有时就是会话目录本身
 - 只有工作区根下真有 `.dsh/settings.yml`，本插件才对该会话生效
-- 配置里的所有路径（`personaFile`、`handlerFile`、MCP `cwd`）都**相对工作区根**写；不接受绝对路径、`~`、盘符，也不能用 `..` 跳出工作区
-- 路径（含符号链接跟随后的真实路径）指向工作区外时，需要工作区已信任，且不在禁止访问列表里
-- `.dsh` 本身可以是指向别处的符号链接（含 Windows junction），比如几个项目共用一份配置：`settings.yml` 和 `.dsh/skills/` 照常读取，工作区根仍是放链接的这个目录。但 `.dsh/` 里的 persona、命令文件算作工作区外，未信任时这些子代理不可用（`/project-config` 显示「需要信任」）；链接目标在禁止访问列表里时，即使已信任也不可用
+- 配置里的所有路径（`personaFile`、`handlerFile`、MCP `cwd`）都**相对工作区根**解析，可以落在工作区外（常见情形是经 `tools/` 这类目录链接）
+- 路径必须存在、类型相符；`personaFile` 和配置文件本身不超过 1MB
+- `.dsh` 本身可以是指向别处的符号链接（含 Windows junction），比如几个项目共用一份配置：`settings.yml`、`.dsh/agents/` 和 `.dsh/skills/` 照常读取。工作区根仍是放链接的这个目录
 - 有 `settings.yml` 的工作区只读自己的 `AGENTS.md` / `CLAUDE.md` 和 `.dsh/skills/`、`.agents/skills/`，**不再继承外层 git 仓库根目录的**。例如 monorepo 的子目录 `packages/app` 放了 `settings.yml`，它就是一个独立的工作区：外层仓库根的 `AGENTS.md` 不会被读到；`packages/shared` 对它来说也在工作区外
 - `settings.yml`、`settings.local.yml` 和 persona 文件各不超过 1MB；YAML 顶层必须是映射
 
@@ -105,7 +105,7 @@ subagents:
 
 ## 4. `commands`：斜杠命令
 
-在输入框发 `/<name>` 时运行工作区里的一个 JS 文件，结果只显示在界面上，**不发给模型**。只在主会话里有，子代理里没有。需要工作区已信任。
+在输入框发 `/<name>` 时运行工作区里的一个 JS 文件，结果只显示在界面上，**不发给模型**。只在主会话里有，子代理里没有。
 
 ```yaml
 commands:
@@ -133,7 +133,7 @@ export default async ({ rawInput, workspaceRoot, agent, attachments, signal }) =
 
 ## 5. `mcp`：MCP 服务器
 
-需要工作区已信任。每个主会话连一次，**子代理共用主会话的连接**，按各自的 `toolFilter` 过滤。第一次调用模型前会等所有服务器第一次连接出结果。连接由本插件自己管理（用 DSH 自带的 MCP SDK），行为和 DSH 内置的 MCP 客户端一致：工具名 `mcp__<serverName>__<工具>`、服务器说明加进系统提示、资源可用 DSH 的 MCP 资源工具读取、工具列表变化自动刷新。
+每个主会话连一次，**子代理共用主会话的连接**，按各自的 `toolFilter` 过滤。第一次调用模型前会等所有服务器第一次连接出结果。连接由本插件自己管理（用 DSH 自带的 MCP SDK），行为和 DSH 内置的 MCP 客户端一致：工具名 `mcp__<serverName>__<工具>`、服务器说明加进系统提示、资源可用 DSH 的 MCP 资源工具读取、工具列表变化自动刷新。
 
 ```yaml
 mcp:
@@ -209,6 +209,7 @@ mcp:
 - `/project-config reconnect <名字>`：重连这一个，已连上的也会断开重连（比如服务器重启过、换了 token）
 - 立即重连，重试次数清零；命令等这次连接有结果后返回状态
 - 第一次调用模型前只等第一次连接；之后才连上的服务器，工具在下一次调用模型时出现
+- **状态是「跳过」的服务器重连不了**：它们根本没建连接（缺环境变量、`cwd` 不合法、`reconnect` 写错），`reconnect` 会直接说明是哪个、为什么，而不是回一句「都已连接」。修好配置后新开会话才生效
 
 **连接什么时候断开**
 
@@ -219,7 +220,7 @@ mcp:
 
 ## 6. `hooks`
 
-需要工作区已信任。键是事件名，值是一组 hook；主会话和子代理里都生效。
+键是事件名，值是一组 hook；主会话和子代理里都生效。
 
 ```yaml
 hooks:
@@ -246,7 +247,7 @@ hooks:
 
 - 标「—」的事件**不要写 `matcher`**，写了就永远匹配不上
 - `agent/turn-stopping` 拦截会让模型继续工作，hook 里要有结束条件，否则会一直循环
-- `agent/created` 只在会话创建时工作区已信任才运行：工作区第一次弹信任询问的那个会话不会触发
+- `agent/created` 在会话创建时运行，此时 MCP 服务器可能还没连上
 - 从 Claude Code 迁移：`PreToolUse` → `tools/pre-execute`，`PostToolUse` → `tools/post-execute`，`UserPromptSubmit` → `agent/pre-step`，`Stop` → `agent/turn-stopping`，`SessionStart` → `agent/created`，`SessionEnd` → `agent/disposed`，`SubagentStart` / `SubagentStop` → `subagent/start` / `subagent/end`
 
 ### matcher
@@ -312,7 +313,7 @@ process.stdin.on('data', (d) => (s += d)).on('end', () => {
 
 - **只有 `settings.yml` 存在时才读取**（`settings.yml` 可以是空文件）。只有 `settings.local.yml` 时什么都不加载
 - 写法和 `settings.yml` 完全一样：同样的四个顶层字段、字段规则、路径规则（相对工作区根）、`${VAR}`、1MB 上限
-- 信任规则也一样：命令、MCP、hooks 要工作区已信任，子代理不需要
+- 字段规则、路径规则、1MB 上限都和 `settings.yml` 一样
 - `.dsh` 是链接时，从链接目标里读
 
 ### 合并规则
@@ -429,12 +430,11 @@ persona 文件的 frontmatter 只用来提供 `description`（省略配置里的
 | 子代理、命令、MCP 都没出现 | `/project-config`：是否读到了 `settings.yml`、工作区根是不是你以为的那个目录 |
 | `settings.local.yml` 没生效 | 有没有 `settings.yml`（可以是空的）；`/project-config` 的「配置文件」一行有没有列出它；有没有「整份文件已忽略」的 `⚠` |
 | local 覆盖后 MCP 少了字段 | 整条替换，不合并字段：local 那条要写全 |
-| 命令、MCP、hooks 显示「需要信任」 | `/workspace-trust trust` |
 | 子代理启动失败 | 看会话里的报错；`toolFilter` 写了不存在的工具名**不会**让它启动失败，只会跳过那条限制 |
 | 子代理没有某个工具，或没有 persona | 工具：`deny` 去掉了 / `allow` 没列；persona：`personaFile` 读到了没有（`/project-config`） |
 | 子代理里没有某个工具 | 它的 `allow` 没列出来；MCP 工具要写全名 |
 | 子代理派不出下层子代理 | §3「子代理再派项目子代理」两个条件 |
-| MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错 |
+| MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错。**改完要新开会话**，`reconnect` 对它无效 |
 | MCP「连接失败」「重试中」 | 看后面的原因；stdio 先在终端里用同样的 `command` / `args` 跑一下。修好后 `/project-config reconnect <名字>` |
 | MCP「连接失败 — tool registration failed: … already registered」 | 有同名工具：换一个 `serverName`，或去掉另一边的同名服务器 |
 | stdio 子进程很多 | 每个打开过的主会话一个，直到 DSH 退出或会话被删除（§5「连接什么时候断开」） |

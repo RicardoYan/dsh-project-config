@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-config",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "Per-workspace subagents, commands, MCP servers and hooks for DSH from .dsh/settings.yml (+ personal settings.local.yml) · 从 .dsh/settings.yml（及个人的 settings.local.yml）为 DSH 工作区加载子代理、命令、MCP 和 hooks",
   "type": "module",
@@ -88,13 +88,7 @@
     "@deepseek-ai/dsh-skill-filesystem": ">=0.2.1-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-subprocess": ">=0.2.1-rc.1 <0.3.0-0",
     "@deepseek-ai/dsh-tool-subagent": ">=0.2.1-rc.1 <0.3.0-0",
-    "@modelcontextprotocol/client": ">=2.0.0 <3.0.0",
-    "dsh-workspace-trust": ">=0.2.0 <0.3.0"
-  },
-  "peerDependenciesMeta": {
-    "dsh-workspace-trust": {
-      "optional": true
-    }
+    "@modelcontextprotocol/client": ">=2.0.0 <3.0.0"
   },
   "icon": "icon.svg"
 }

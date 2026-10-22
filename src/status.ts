@@ -47,13 +47,9 @@ export interface StatusRoot {
   localFile?: string | undefined
   ok: boolean
   error?: unknown
-  trust: string
   origin: StatusOrigin | undefined
   warnings: ReadonlyArray<unknown>
-  gatedWarnings?: ReadonlyArray<unknown> | undefined
   subagentSpecs: ReadonlyArray<StatusSpec>
-  deferredSpecs: ReadonlyArray<{ toolName: string }>
-  trustedSpecs?: ReadonlyArray<StatusSpec> | undefined
   settings: StatusSettings
   hooksLocal?: Record<string, number> | undefined
   removed?: ReadonlyArray<StatusRemoval> | undefined
@@ -70,7 +66,6 @@ export interface StatusMount extends Partial<StatusRoot> {
 
 /** Services `statusText` needs besides the mount. */
 export interface StatusDeps {
-  hasTrust: boolean
   logFile: string
 }
 
@@ -88,7 +83,7 @@ function marked(root: StatusRoot, kind: string, name: string, shown: string = na
   return shown
 }
 
-export function statusText(mount: StatusMount | undefined, { hasTrust, logFile }: StatusDeps): string {
+export function statusText(mount: StatusMount | undefined, { logFile }: StatusDeps): string {
   if (mount === undefined) return String(TEXT.noSettings)
   const root: StatusRoot = mount.rootMount ?? (mount as StatusRoot)
   // Mixed on purpose: bilingual `Text` values and already-rendered strings share
@@ -97,14 +92,11 @@ export function statusText(mount: StatusMount | undefined, { hasTrust, logFile }
   if (mount.rootMount) lines.push(TEXT.subagentSession(mount.toolName as string))
   lines.push(TEXT.workspace(root.root))
   lines.push(TEXT.settingsFile(root.localFile ? `${root.file} + ${root.localFile}` : root.file))
-  lines.push(TEXT.trust(lookup(TEXT.state, root.trust) ?? root.trust, !hasTrust))
   if (!root.ok) {
     lines.push(`✗ ${root.error}`)
     return lines.join('\n')
   }
-  const subs = mount.rootMount
-    ? (mount.subagents ?? [])
-    : [...root.subagentSpecs, ...(root.trustedSpecs ?? [])]
+  const subs = mount.rootMount ? (mount.subagents ?? []) : root.subagentSpecs
   lines.push(
     TEXT.subagents(
       subs.length
@@ -114,32 +106,20 @@ export function statusText(mount: StatusMount | undefined, { hasTrust, logFile }
         : '—',
     ),
   )
-  const gated = root.trust === 'trusted'
-  const blocked = gated ? '' : TEXT.requiresTrust
-  if (!gated && root.deferredSpecs.length > 0) {
-    lines.push(
-      TEXT.deferredSubagents(
-        blocked,
-        root.deferredSpecs.map((e) => marked(root, 'subagents', e.toolName)).join(', '),
-      ),
-    )
-  }
   if (root.settings.commands.length > 0) {
     lines.push(
       TEXT.commands(
-        blocked,
         root.settings.commands.map((c) => marked(root, 'commands', c.name, `/${c.name}`)).join(', '),
         mount.rootMount !== undefined,
       ),
     )
   }
   if (root.settings.mcp.length > 0) {
-    if (!gated) {
-      lines.push(
-        TEXT.mcpBlocked(blocked, root.settings.mcp.map((m) => marked(root, 'mcp', m.serverName)).join(', ')),
-      )
+    const servers = root.hub?.summary()
+    if (servers === undefined || servers.length === 0) {
+      lines.push(TEXT.mcp(root.settings.mcp.map((m) => marked(root, 'mcp', m.serverName)).join(', ')))
     } else {
-      for (const s of root.hub?.summary() ?? []) {
+      for (const s of servers) {
         lines.push(TEXT.mcpServer(marked(root, 'mcp', s.name), lookup(TEXT.mcpState, s.status) ?? s.status, s.detail))
       }
     }
@@ -148,11 +128,10 @@ export function statusText(mount: StatusMount | undefined, { hasTrust, logFile }
   if (hookEvents.length > 0) {
     lines.push(
       TEXT.hooks(
-        blocked,
         hookEvents
           .map(([e, l]) => `${e} ×${l.length}${root.hooksLocal?.[e] ? TEXT.hooksLocal(root.hooksLocal[e]) : ''}`)
           .join(', '),
-        gated ? root.stats : undefined,
+        root.stats ?? { runs: 0, failures: 0 },
       ),
     )
   }
@@ -165,7 +144,7 @@ export function statusText(mount: StatusMount | undefined, { hasTrust, logFile }
       ),
     )
   }
-  for (const w of [...root.warnings, ...(root.gatedWarnings ?? [])]) lines.push(`⚠ ${w}`)
+  for (const w of root.warnings) lines.push(`⚠ ${w}`)
   lines.push(TEXT.log(logFile))
   return lines.join('\n')
 }

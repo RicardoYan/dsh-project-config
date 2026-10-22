@@ -39,7 +39,7 @@ export const hooksField: keyof Settings = 'hooks'
 
 // A mount's identity fields, read by the status report and the release paths.
 export const mountLabel: keyof RootMount = 'label'
-export const mountTrust: keyof RootMount = 'trust'
+export const mountFeatures: keyof RootMount = 'features'
 
 // The connection's public surface, driven by the hub and the status report.
 export const connectionState: keyof McpConnection = 'state'

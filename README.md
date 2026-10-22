@@ -7,8 +7,7 @@ DSH 自带的只读取项目里的 `AGENTS.md` 和 `.dsh/skills/`；子代理、
 ## 安装
 
 ```sh
-dsh plugin --profile desktop add github:RicardoYan/dsh-workspace-trust#v0.2.1
-dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.2.1
+dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.3.0
 ```
 
 Web 端把 `desktop` 换成你的 profile 名（一般是 `web`）。装完重启 DSH。
@@ -47,12 +46,12 @@ hooks:
 - 子代理、MCP、hooks 对子代理同样生效；子代理共用主会话的 MCP 连接，按自己的 `toolFilter` 过滤（MCP 工具写全名）
 - 子代理再派项目子代理：把对方的名字写进自己的 `allow`，并且对方的 `maxDepth` 要够（`maxDepth` 是它最多能出现在第几层，主会话直接派的是第 1 层）
 - DSH 自带的通用 `subagent` 工具每个子代理都有，`toolFilter` 管不到它，写不写都一样；嵌套层数由 DSH 的子代理层数上限控制
-- `/project-config` 查看本会话加载了什么、哪些被跳过及原因，以及每个 MCP 服务器的连接状态；`/project-config reconnect [名字]` 在当前会话里重连 MCP 服务器
+- `/project-config` 查看本会话加载了什么、哪些被跳过及原因，以及每个 MCP 服务器的连接状态；`/project-config reconnect [名字]` 在当前会话里重连 MCP 服务器（不带名字只重连没连上的；状态是「跳过」的服务器没有连接，重连会说明原因，需要改配置后新开会话）
 
 ## 安全边界
 
-- 命令、MCP、hooks 会运行项目里的代码，**只在工作区已信任时运行**；信任由 [dsh-workspace-trust](https://github.com/RicardoYan/dsh-workspace-trust) 记录。没装它时一律按不信任处理，子代理照常可用
-- 配置里的路径只接受相对路径；指向工作区外的（含符号链接）要求已信任，且不在禁止访问列表里
+- 命令、MCP、hooks 会运行项目里的代码，**配置了就会在会话里运行**，没有确认步骤
+- 配置里的路径相对工作区根解析，可以落在工作区外（例如经 `tools/` 这类目录链接）；只检查存在性与类型，不做范围限制
 - 有 `settings.yml` 的工作区只读取自己的 `AGENTS.md` 和项目 skill，不再继承外层 git 仓库根目录的
 
 ## 注意

@@ -14,7 +14,7 @@ import path from 'node:path'
 import type { Context, Fiber } from '@deepseek-ai/cordis'
 import { apply as instructionsApply } from '@deepseek-ai/dsh-agent-instructions'
 import { FileSystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem'
-import { builtinFindRoot } from './workspace.js'
+import { findRoot } from './workspace.js'
 
 export const MARKER = '.dsh/settings.yml'
 const PATCHED = Symbol.for('dsh-project-config/skill-roots')
@@ -36,7 +36,7 @@ async function realOrResolved(p: string): Promise<string> {
 }
 
 async function settingsRoot(cwd: string): Promise<string | undefined> {
-  const root = await builtinFindRoot(cwd)
+  const root = await findRoot(cwd)
   try {
     if ((await fs.promises.stat(path.join(root, '.dsh', 'settings.yml'))).isFile()) return root
   } catch {
