@@ -611,6 +611,138 @@ hooks:
   truthy('mcp state: status line en', inLang('en', () => statusText(m, { logFile: 'L' })).includes('MCP k: ✗ failed, retrying — HTTP 401 (retry 1/10)'));
   truthy('mcp state: status line zh', inLang('zh', () => statusText(m, { logFile: 'L' })).includes('MCP k：✗ 连接失败，重试中 — HTTP 401（第 1/10 次重试）'));
 }
+
+// ---------------------------------------------------------------- MCP health check: unresponsive, never dropped
+{
+  const { McpConnection, DEFAULT_HEALTH_CHECK_MS, UNRESPONSIVE_AFTER } = await import('../lib/features/mcp-connection.js');
+
+  // A clock that runs the health timer by hand, so the measured delay is exact.
+  let now = 0;
+  const timers = [];
+  const clock = {
+    now: () => now,
+    setTimer: (fn, ms) => { const t = { fn, at: now + ms }; timers.push(t); return t; },
+    clearTimer: (t) => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); },
+  };
+  const settle = async () => { for (let i = 0; i < 12; i++) await new Promise((r) => setImmediate(r)); };
+  /** Advance the clock to the next timer, run it, and report how far time moved. */
+  const tick = async () => {
+    const t = timers.shift();
+    if (t === undefined) return undefined;
+    const moved = t.at - now;
+    now = t.at;
+    t.fn();
+    await settle();
+    return moved;
+  };
+
+  const fake = fakeMcp();
+  fake.tools = [{ name: 'echo', inputSchema: { type: 'object' } }];
+  const registered = new Map();
+  const conn = new McpConnection({ serverName: 'h', transport: 'streamable-http', url: 'http://h/mcp' }, {
+    ctx: {}, register: (d) => { registered.set(d.name, d); return () => registered.delete(d.name); },
+    log: quietLog, ...clock, healthCheckMs: DEFAULT_HEALTH_CHECK_MS,
+    transportFactory: fake.transportFactory, clientFactory: fake.clientFactory,
+  });
+
+  check('health: defaults are 30s x 3', [DEFAULT_HEALTH_CHECK_MS, UNRESPONSIVE_AFTER], [30000, 3]);
+  await conn.start();
+  check('health: connected, timer armed', [conn.status().state, timers.length], ['connected', 1]);
+  check('health: timer interval is 30s', timers[0].at - now, 30000);
+
+  // Healthy server: every check answers, nothing is reported.
+  fake.pingError = undefined;
+  for (let i = 0; i < 5; i++) await tick();
+  check('health: healthy pings keep it connected', [conn.status().state, conn.status().unresponsive], ['connected', false]);
+
+  // Now the server goes silent: the ping times out (not a connection error).
+  fake.pingError = Object.assign(new Error('Request timed out'), { code: 'REQUEST_TIMEOUT' });
+  const marks = [];
+  for (let i = 0; i < 3; i++) {
+    await tick();
+    marks.push(conn.status().unresponsive);
+  }
+
+  // It still reports "connected": a silent server is not a dropped connection.
+  check('health: silent server stays connected', conn.status().state, 'connected');
+  check('health: tools kept while unresponsive', registered.size, 1);
+
+  // The streak marks it on the 3rd unanswered check, not before.
+  check('health: marked only on the 3rd timeout', marks, [false, false, true]);
+
+  // One answer clears it.
+  fake.pingError = undefined;
+  await tick();
+  check('health: a reply clears unresponsive', [conn.status().state, conn.status().unresponsive], ['connected', false]);
+
+  // A real connection error still drops it (that is not "unresponsive").
+  fake.pingError = Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+  fake.connectError = () => new Error('down');
+  await tick();
+  check('health: connection error still reconnects', conn.status().state, 'reconnecting');
+  check('health: health timer cleared while reconnecting', timers.every((t) => t.at - now !== 30000), true);
+
+  // A JSON-RPC error answer proves the server is alive.
+  fake.connectError = undefined;
+  fake.pingError = undefined;
+  await conn.reconnect();
+  const { ProtocolError } = await import('@modelcontextprotocol/client');
+  fake.pingError = new ProtocolError(-32601, 'ping not supported');
+  for (let i = 0; i < 4; i++) await tick();
+  check('health: protocol error answer keeps it responsive', [conn.status().state, conn.status().unresponsive], ['connected', false]);
+  fake.pingError = undefined;
+
+  // dispose leaves no timer behind
+  await conn.dispose();
+  check('health: dispose clears the timer', [conn.status().state, timers.length], ['stopped', 0]);
+
+  // --- hub: an unresponsive server is picked up by reconnect-all ----------
+  let hubNow = 0;
+  const hubTimers = [];
+  const hubClock = {
+    now: () => hubNow,
+    setTimer: (fn, ms) => { const t = { fn, at: hubNow + ms }; hubTimers.push(t); return t; },
+    clearTimer: (t) => { const i = hubTimers.indexOf(t); if (i >= 0) hubTimers.splice(i, 1); },
+  };
+  const fakeHub = fakeMcp();
+  fakeHub.tools = [{ name: 't', inputSchema: { type: 'object' } }];
+  const hub = new McpHub(quietLog, 't');
+  await hub.startIn(fakeScope(), [{ serverName: 'a' }],
+    async (e) => ({ config: { serverName: e.serverName, transport: 'streamable-http', url: 'http://h/' + e.serverName } }),
+    { ...hubClock, transportFactory: fakeHub.transportFactory, clientFactory: fakeHub.clientFactory });
+
+  const hubTick = async () => {
+    const t = hubTimers.shift();
+    if (t === undefined) return;
+    hubNow = t.at;
+    t.fn();
+    await settle();
+  };
+  const sumHub = () => hub.summary().map((x) => [x.name, x.status, x.detail === undefined ? undefined : inLang('en', () => `${x.detail}`)]);
+
+  check('hub health: connected', sumHub(), [['a', 'connected', '1 tool']]);
+
+  fakeHub.pingError = Object.assign(new Error('Request timed out'), { code: 'REQUEST_TIMEOUT' });
+  for (let i = 0; i < 3; i++) await hubTick();
+  check('hub health: shows unresponsive, not connected', sumHub()[0][1], 'unresponsive');
+  truthy('hub health: says the tools are kept', sumHub()[0][2].includes('tools kept'));
+
+  // reconnect-all must include it; before this it would have claimed "all up".
+  check('hub health: reconnect-all takes the unresponsive server', await hub.reconnect(), ['a']);
+  fakeHub.pingError = undefined;
+  check('hub health: back to connected after reconnect', sumHub()[0][1], 'connected');
+
+  // ... and once it is healthy again, reconnect-all has nothing to do.
+  check('hub health: reconnect-all skips a healthy server', await hub.reconnect(), []);
+
+  await hub.disposeAll();
+
+  check('health: zh text', inLang('zh', () => `${TEXT.mcpState.unresponsive} — ${TEXT.mcpUnresponsive}`),
+    '⚠ 无响应 — 连续 3 次检测没有回应，工具仍在（可以用 /project-config reconnect 重连）');
+  check('health: en text', inLang('en', () => `${TEXT.mcpState.unresponsive} — ${TEXT.mcpUnresponsive}`),
+    '⚠ unresponsive — no reply to 3 health checks; tools kept (use /project-config reconnect to restart it)');
+  check('health: en text has no chinese', CJK.test(inLang('en', () => `${TEXT.mcpState.unresponsive} ${TEXT.mcpUnresponsive}`)), false);
+}
 {
   const { DEFAULT_LOG_FILE } = await import('../lib/log.js');
   check('log: default path has no 8.3 short names', /~\d/.test(DEFAULT_LOG_FILE), false);

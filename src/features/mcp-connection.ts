@@ -48,6 +48,13 @@ export const RECONNECT_DEFAULTS = Object.freeze({
 })
 export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000
 export const DEFAULT_MAX_INSTRUCTION_BYTES = 32_768
+/**
+ * Interval of the periodic health check. Off unless a caller asks for it: the
+ * hub does, the connection self-tests drive the clock themselves.
+ */
+export const DEFAULT_HEALTH_CHECK_MS = 30_000
+/** Unanswered health checks in a row before a server is called unresponsive. */
+export const UNRESPONSIVE_AFTER = 3
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const CLOSE_TIMEOUT_MS = 5_000
 const STDERR_TAIL_BYTES = 2_048
@@ -192,6 +199,8 @@ export interface McpConnectionOptions {
   clearTimer?(timer: unknown): void
   transportFactory?(config: ServerConfig): TransportLike
   clientFactory?(onListChanged: () => void): ClientLike
+  /** Health-check interval in ms; 0 (the default) disables the periodic check. */
+  healthCheckMs?: number
 }
 
 /** The state machine's names, as `/project-config` prints them. */
@@ -205,6 +214,12 @@ export interface ConnectionStatus {
   error: string | undefined
   errorAt: number | undefined
   attempt: { n: number; max: number } | undefined
+  /**
+   * True while a connected server has stopped answering health checks but the
+   * connection is still up. Never a reason to drop the connection: a busy
+   * single-threaded server looks exactly the same.
+   */
+  unresponsive: boolean
 }
 
 /** One connection attempt. */
@@ -244,6 +259,7 @@ export class McpConnection {
   readonly clearTimer: (timer: unknown) => void
   readonly transportFactory: (config: ServerConfig) => TransportLike
   readonly clientFactory: (onListChanged: () => void) => ClientLike
+  readonly healthCheckMs: number
 
   state: ConnectionState = 'connecting'
   /** `{ message, at }` of the last failure. */
@@ -253,6 +269,11 @@ export class McpConnection {
   connectedAt: number | undefined = undefined
   checkedAt: number | undefined = undefined
   nextAttemptAt: number | undefined = undefined
+  /** Health checks in a row that got no reply (timeouts and other non-answers). */
+  unansweredStreak = 0
+  /** True once the streak reached `UNRESPONSIVE_AFTER`; cleared by one reply. */
+  unresponsive = false
+  healthTimer: unknown = undefined
   instructions = ''
   disposers = new Map<string, () => void>()
   gen: Generation | undefined = undefined
@@ -287,6 +308,7 @@ export class McpConnection {
       })
     this.clearTimer = opts.clearTimer ?? ((t) => clearTimeout(t as ReturnType<typeof setTimeout>))
     this.transportFactory = opts.transportFactory ?? createTransport
+    this.healthCheckMs = opts.healthCheckMs ?? 0
     this.clientFactory =
       opts.clientFactory ??
       ((onListChanged) =>
@@ -336,6 +358,68 @@ export class McpConnection {
         this.state === 'retrying' || this.state === 'reconnecting'
           ? { n: this.attempt, max: this.policy.maxAttempts }
           : undefined,
+      unresponsive: this.unresponsive,
+    }
+  }
+
+  /** Whether a connected server has stopped answering health checks. */
+  isUnresponsive(): boolean {
+    return this.state === 'connected' && this.unresponsive
+  }
+
+  /** A health check got an answer: clear the streak and any reported silence. */
+  markResponsive(): void {
+    this.checkedAt = this.now()
+    this.unansweredStreak = 0
+    if (this.unresponsive) {
+      this.unresponsive = false
+      this.log.info(`mcp ${this.name}: responding again`)
+      this.changed()
+    }
+  }
+
+  /**
+   * A health check got no answer. A timeout is the usual cause; this never
+   * drops the connection, it only reports the silence once it lasts.
+   */
+  markUnanswered(): void {
+    this.unansweredStreak += 1
+    if (this.unansweredStreak >= UNRESPONSIVE_AFTER && !this.unresponsive) {
+      this.unresponsive = true
+      this.log.warn(`mcp ${this.name}: no reply to ${this.unansweredStreak} health checks; tools kept`)
+      this.changed()
+    }
+  }
+
+  /** Forget the unanswered streak (new generation, manual reconnect, dispose). */
+  resetUnresponsive(): void {
+    this.unansweredStreak = 0
+    this.unresponsive = false
+  }
+
+  /** Arm the next health check; a no-op unless `healthCheckMs` is set. */
+  startHealthTimer(): void {
+    this.stopHealthTimer()
+    if (this.healthCheckMs <= 0 || this.disposed) return
+    const tick = (): void => {
+      this.healthTimer = undefined
+      if (this.disposed || this.state !== 'connected') return
+      void this.check().then(
+        () => {
+          if (!this.disposed && this.state === 'connected') this.startHealthTimer()
+        },
+        () => {
+          if (!this.disposed && this.state === 'connected') this.startHealthTimer()
+        },
+      )
+    }
+    this.healthTimer = this.setTimer(tick, this.healthCheckMs)
+  }
+
+  stopHealthTimer(): void {
+    if (this.healthTimer !== undefined) {
+      this.clearTimer(this.healthTimer)
+      this.healthTimer = undefined
     }
   }
 
@@ -350,6 +434,7 @@ export class McpConnection {
   /** One attempt: fresh transport + client, connect, list tools, swap them in. Never rejects. */
   async connect(): Promise<void> {
     if (this.disposed) return
+    this.stopHealthTimer()
     const gen: Generation = { client: undefined, transport: undefined, closed: false, stderr: '' }
     this.gen = gen
     let closedResolve: (() => void) | undefined
@@ -392,10 +477,12 @@ export class McpConnection {
       this.connectedAt = this.now()
       this.state = 'connected'
       this.lastError = undefined
+      this.resetUnresponsive()
       this.log.info(
         `mcp ${this.name}: connected (${this.toolCount} ${this.toolCount === 1 ? 'tool' : 'tools'})${recovered ? ` after ${this.attempt} failed attempts` : ''}`,
       )
       this.changed()
+      this.startHealthTimer()
     } catch (error) {
       gen.settled = true
       if (!this.isCurrent(gen)) {
@@ -439,6 +526,8 @@ export class McpConnection {
   lost(gen: Generation, error: unknown): void {
     if (!this.isCurrent(gen) || this.state !== 'connected') return
     this.gen = undefined
+    this.stopHealthTimer()
+    this.resetUnresponsive()
     if (error !== undefined) this.setError(error)
     else if (this.lastError === undefined) {
       this.setError(
@@ -495,6 +584,8 @@ export class McpConnection {
       this.clearTimer(this.timer)
       this.timer = undefined
     }
+    this.stopHealthTimer()
+    this.resetUnresponsive()
     const gen = this.gen
     this.gen = undefined
     if (gen !== undefined) await this.closeGen(gen)
@@ -618,21 +709,25 @@ export class McpConnection {
 
   /**
    * Confirm a connected server still answers (`ping`, 5s). Only a transport
-   * failure marks it lost: a JSON-RPC error answer proves the connection, and a
-   * timeout or an unsupported ping leaves the state as it is.
+   * failure marks it lost: a JSON-RPC error answer proves the connection, and
+   * anything else (a timeout, most often) counts as one unanswered check and
+   * leaves the connection alone — a busy server looks exactly the same.
    */
   async check(): Promise<void> {
     const gen = this.gen
     if (gen === undefined || this.state !== 'connected') return
     try {
       await (gen.client as ClientLike).ping({ timeout: CHECK_TIMEOUT_MS })
-      this.checkedAt = this.now()
+      this.markResponsive()
     } catch (error) {
+      if (!this.isCurrent(gen) || this.state !== 'connected') return
       if (error instanceof ProtocolError) {
-        this.checkedAt = this.now()
+        // The server answered, just not with success.
+        this.markResponsive()
         return
       }
       if (isConnectionError(error)) this.lost(gen, error)
+      else this.markUnanswered()
     }
   }
 
@@ -682,6 +777,8 @@ export class McpConnection {
     this.disposed = true
     this.state = 'stopped'
     this.instructions = ''
+    this.stopHealthTimer()
+    this.resetUnresponsive()
     if (this.timer !== undefined) {
       this.clearTimer(this.timer)
       this.timer = undefined

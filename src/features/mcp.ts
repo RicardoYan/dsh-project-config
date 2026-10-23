@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Text } from '../locale.js'
 import { expandVars, type McpSpec } from '../settings.js'
 import { TEXT } from '../text.js'
-import { McpConnection, type ServerConfig } from './mcp-connection.js'
+import { McpConnection, DEFAULT_HEALTH_CHECK_MS, type ServerConfig } from './mcp-connection.js'
 import { admits } from './subagents.js'
 
 const MASK = '***'
@@ -239,6 +239,7 @@ export class McpHub {
             warn: (t: string) => this.log.warn(`${this.label}: ${clean(t)}`),
           },
           clean,
+          healthCheckMs: DEFAULT_HEALTH_CHECK_MS,
           ...connectionOpts,
         })
       } catch (error) {
@@ -282,7 +283,9 @@ export class McpHub {
   }
 
   /**
-   * Reconnect one server (any state) or, without a name, every server that is not connected.
+   * Reconnect one server (any state) or, without a name, every server that is
+   * not connected. An unresponsive server counts as not connected here: it is
+   * up but silent, and restarting it is the only fix the command can offer.
    * @returns the names reconnected, or undefined when `name` is unknown.
    * @throws when a target was never connected because its config was rejected;
    *   such a server needs a settings fix and a new session, not a reconnect.
@@ -297,7 +300,7 @@ export class McpHub {
     } else {
       targets = [...this.servers.values()]
         .map((r) => r.connection)
-        .filter((x): x is McpConnection => x !== undefined && x.state !== 'connected')
+        .filter((x): x is McpConnection => x !== undefined && (x.state !== 'connected' || x.isUnresponsive()))
     }
     await Promise.allSettled(targets.map((x) => x.reconnect()))
     return targets.map((x) => x.name)
@@ -405,6 +408,11 @@ export class McpHub {
       }
       const st = r.connection.status()
       let detail: string | Text | undefined
+      // An unresponsive server is still connected: the tools stay listed, so
+      // report the silence rather than the tool count.
+      if (st.state === 'connected' && st.unresponsive) {
+        return { name, status: 'unresponsive', detail: TEXT.mcpUnresponsive }
+      }
       if (st.state === 'connected') detail = TEXT.tools(st.tools)
       else if (st.state === 'retrying' || st.state === 'reconnecting') {
         detail = TEXT.mcpRetry(st.error, st.attempt ?? { n: 0, max: 0 })
