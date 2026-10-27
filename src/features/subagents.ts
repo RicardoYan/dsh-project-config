@@ -3,7 +3,7 @@
 // Official interfaces relied on (@deepseek-ai/dsh-tool-subagent):
 // - `apply(ctx, config)` registers the delegation tool through `ctx.tools.register`
 //   and its prompt section through `ctx.systemPrompt`.
-// - config: provider, toolName, backgroundMode, maxDepth, agentPreset.
+// - config: provider, toolName, maxDepth, agentOptions, agentPreset.
 //   DSH 0.2.1 removed `persona` and `toolFilter` from this config: both now throw
 //   ("no longer supported; configure persona and tool plugins in an Agent Preset
 //   and select it with agentPreset"). Selecting a preset is optional, and NOT
@@ -306,8 +306,8 @@ export function mountSubagentTools(
         subagentApply(scoped, {
           provider: entry.provider as never,
           toolName: entry.toolName,
-          backgroundMode: entry.backgroundMode as never,
           maxDepth: entry.maxDepth,
+          ...(entry.agentOptions !== undefined ? { agentOptions: entry.agentOptions } : {}),
         } as never)
       } catch (error) {
         spec.error = errorMessage(error)

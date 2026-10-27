@@ -15,6 +15,7 @@
 6. **命令、MCP、hooks 只要配置了就会运行**，不额外询问；只在该工作区的会话里生效
 7. **`skills` 字段已不支持**：skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读
 8. **hooks 的事件名是 DSH 的**（`tools/pre-execute`），不是 `PreToolUse`；Windows 上 hook 命令由 PowerShell 执行
+9. **`backgroundMode` 字段已删除**（v0.4.0）：DSH 0.2.1 起子代理统一是「后台运行 + 可续聊」，没有前台/后台的开关。配置里留着这个字段只会得到一条「未知字段」警告，条目照常加载。删掉即可
 
 ## 2. 文件位置与工作区
 
@@ -51,8 +52,9 @@ subagents:
     toolFilter:                             # 可选，限制子代理能用哪些工具
       deny: [write, edit]                   # 只读角色：去掉写文件的工具
     maxDepth: 1                             # 可选，默认 1
-    backgroundMode: continuable             # 可选，默认 continuable
     provider: spawn                         # 可选，默认 spawn，一般不用改
+    agentOptions:                           # 可选，指定这个子代理的 LLM 参数
+      reasoningEffort: high                 # 写了就指定；没写的字段继承主会话
 ```
 
 | 字段 | 必填 | 说明 |
@@ -62,8 +64,8 @@ subagents:
 | `description` | 否 | 用途，显示在主会话的「项目子代理」清单里，模型据此选择。省略时用 persona frontmatter 的 `description` |
 | `toolFilter` | 否 | 从继承来的工具池里裁剪：`allow` 白名单 / `deny` 黑名单。两个都写时都能生效。不写就是全部继承 |
 | `maxDepth` | 否 | 这个子代理**最多能出现在第几层**。主会话直接派出的是第 1 层；默认 1，表示只有主会话能派它 |
-| `backgroundMode` | 否 | `continuable`：默认后台运行，结束时通知主会话，之后还能继续对话；`one-shot`：默认前台运行，等结果 |
 | `provider` | 否 | DSH 的子代理提供方，默认 `spawn`（全新子会话，看不到主会话的对话） |
+| `agentOptions` | 否 | 这个子代理的 LLM 配置：`provider` / `model` / `reasoningEffort` / `maxTokens`，四者均可选。只写 `reasoningEffort` 时模型继承主会话。见下 |
 
 persona 文件示例：
 
@@ -73,6 +75,54 @@ description: 审查代码改动并指出问题
 ---
 你是代码审查员。只读代码，不修改文件。……
 ```
+
+### `agentOptions`
+
+给这个子代理指定 LLM 参数。四个字段都可选，**写了哪个就指定哪个**，没写的才继承主会话：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `provider` | 文字 | LLM 提供方 id（如 `deepseek`）。**必须与 `model` 同时写** |
+| `model` | 文字 | 模型 id（如 `deepseek-flash`）。**必须与 `provider` 同时写** |
+| `reasoningEffort` | 文字 | 思考档，直接指定。必须是该模型**声明过的**值，写错子代理启动时直接报错 |
+| `maxTokens` | 正整数 | 输出上限 |
+
+```yaml
+subagents:
+  # 1. 只指定思考档。provider/model 不写 → 跟着主会话走
+  - toolName: res-phase3-auditor
+    personaFile: .dsh/agents/research-engine/res-phase3-auditor.md
+    maxDepth: 3
+    agentOptions:
+      reasoningEffort: high
+
+  # 2. 只指定模型。provider 和 model 必须成对，思考档不写 → 跟着主会话走
+  - toolName: cheap-scanner
+    personaFile: .dsh/agents/cheap-scanner.md
+    agentOptions:
+      provider: deepseek
+      model: deepseek-flash
+
+  # 3. 模型和思考档都指定
+  - toolName: deep-thinker
+    personaFile: .dsh/agents/deep-thinker.md
+    agentOptions:
+      provider: deepseek
+      model: deepseek-v4-pro
+      reasoningEffort: max
+```
+
+**要点**：
+
+- **每个字段都是直接指定的值**，不是相对主会话的加减。写 `reasoningEffort: high` 就是 `high`——主会话是 `max` 还是 `low` 都一样，也可以比主会话更高
+- **没写的字段继承主会话**。所以只写 `reasoningEffort` 时，provider 和 model 都跟着主会话走；只写 `provider`+`model` 时，思考档跟着主会话走
+- **`provider` 与 `model` 是一条路由的两半**，必须同时写。只写一半时另一半会从主会话继承，拼出来的组合可能根本不存在：跨 provider 时子代理启动就失败（`pi-ai provider "x" has no configured model "y"`），同一 provider 时则静默跑在你没预期的模型上。**本插件在配置期就拦掉**
+- **`reasoningEffort` 的合法值取决于最终生效的模型**。指定了不一样的模型又不写 `reasoningEffort` 时，思考档仍从主会话继承，那个值在新模型上不一定存在——这种情况建议把 `reasoningEffort` 一起写上
+- 写了个模型没有的档位，子代理**启动时直接报错**，不是静默忽略。查看某模型声明了哪些档位：在 DSH 的设置界面看模型详情，或翻 profile 的 `cordis.patch.yml` 里该模型的 `reasoningEfforts`
+- 配了 `provider` / `model` / `reasoningEffort` 任一项，DSH 会在派发子代理前先做一次路由预检（`llm.resolveCallConfig()`），把不可用的组合拦在调用之前
+- **`agentOptions` 里出现未知键、或写成空对象 `{}`，整条子代理条目会被跳过**并给一条 `⚠`，不是只忽略那个键
+
+**改完怎么确认真的生效**：`/project-config` 只能证明配置被读进去了，证明不了子代理真的拿到了这些值。要确认得跑一次子代理，然后看它的会话日志——`~/.dsh/sessions/<工作区>/<子代理会话id>/session.v4.jsonl.zstd` 解压后，找 `type: "request/header"` 的事件，读 `data.header.config` 里的 `provider` / `model` / `reasoningEffort`。
 
 ### `toolFilter`
 
@@ -452,7 +502,7 @@ persona 文件的 frontmatter 只用来提供 `description`（省略配置里的
 | frontmatter | 在这里怎么办 |
 |---|---|
 | `tools` / `disallowedTools` | 换成 `toolFilter`，见上 |
-| `model` | 不生效。子代理继承主会话的模型；要换模型用 DSH 的子代理模型设置 |
+| `model` | 不生效。子代理默认跟随主会话的模型；要指定用 `agentOptions.model`（与 `agentOptions.provider` 一起写） |
 | `permissionMode` | 不生效。权限由会话的权限预设决定 |
 | `skills` | 不生效。skill 放 `.dsh/skills/<名字>/SKILL.md`，DSH 自己读 |
 | `mcpServers` | 不生效。服务器写在 `settings.yml` 的 `mcp` 里，对该工作区所有子代理生效 |
@@ -469,6 +519,11 @@ persona 文件的 frontmatter 只用来提供 `description`（省略配置里的
 | 子代理没有某个工具，或没有 persona | 工具：`deny` 去掉了 / `allow` 没列；persona：`personaFile` 读到了没有（`/project-config`） |
 | 子代理里没有某个工具 | 它的 `allow` 没列出来；MCP 工具要写全名 |
 | 子代理派不出下层子代理 | §3「子代理再派项目子代理」两个条件 |
+| `agentOptions` 那条被跳过 | 未知键、空对象 `{}`、`provider`/`model` 只写一个、`maxTokens` 不是正整数——`/project-config` 的 `⚠` 会写明是哪一条 |
+| 子代理启动时报 `does not support reasoning effort "x"` | `agentOptions.reasoningEffort` 写了该模型没声明的档位。改模型支持的值，或去掉这一项 |
+| 子代理启动时报 `has no configured model` | `agentOptions` 里的 `provider`/`model` 组合不存在。确认那个 provider 下确实有这个模型 |
+| 配了 `agentOptions` 但看起来没生效 | `/project-config` 只能证明配置读进去了。要确认得跑一次子代理，解压它的会话日志看 `request/header` 里的 `data.header.config.reasoningEffort`（§3「agentOptions」） |
+| 警告里出现「未知字段 backgroundMode」 | v0.4.0 起该字段已删除（DSH 不再支持前台/后台切换）。从配置里删掉这一行即可，条目本来就在正常加载 |
 | MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错。**改完要新开会话**，`reconnect` 对它无效 |
 | MCP「连接失败」「重试中」 | 看后面的原因；stdio 先在终端里用同样的 `command` / `args` 跑一下。修好后 `/project-config reconnect <名字>` |
 | MCP「连接失败 — tool registration failed: … already registered」 | 有同名工具：换一个 `serverName`，或去掉另一边的同名服务器 |

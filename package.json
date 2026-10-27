@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-config",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "description": "Per-workspace subagents, commands, MCP servers and hooks for DSH from .dsh/settings.yml (+ personal settings.local.yml) · 从 .dsh/settings.yml（及个人的 settings.local.yml）为 DSH 工作区加载子代理、命令、MCP 和 hooks",
   "type": "module",

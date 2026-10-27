@@ -164,7 +164,7 @@ skills:
 other: 1
 `);
   check('settings: ok', r.ok, true);
-  check('settings: subagents kept', r.settings.subagents.map((s) => [s.toolName, s.provider, s.backgroundMode, s.maxDepth]), [['code-reviewer', 'spawn', 'continuable', 1]]);
+  check('settings: subagents kept', r.settings.subagents.map((s) => [s.toolName, s.provider, s.agentOptions, s.maxDepth]), [['code-reviewer', 'spawn', undefined, 1]]);
   check('settings: commands kept', r.settings.commands.map((c) => c.name), ['hello']);
   check('settings: mcp kept', r.settings.mcp.map((m) => m.serverName), ['local', 'web']);
   check('settings: mcp unknown field dropped', 'extra' in r.settings.mcp[0], false);
@@ -183,6 +183,58 @@ other: 1
   check('settings: bad yaml', parseSettings('a: [').ok, false);
   check('settings: non-mapping', parseSettings('- 1').ok, false);
   check('settings: empty file ok', parseSettings('').ok, true);
+}
+
+// ---------------------------------------------------------------- agentOptions
+{
+  const sub = (extra) => parseSettings(`subagents:\n  - toolName: a\n    personaFile: a.md\n${extra}`);
+  const kept = (text) => sub(text).settings.subagents[0]?.agentOptions;
+  const why = (text) => inLang('en', () => sub(text).warnings.join('\n'));
+  const whyZh = (text) => inLang('zh', () => sub(text).warnings.join('\n'));
+
+  check('agentOptions: effort only survives', kept('    agentOptions:\n      reasoningEffort: high\n'), { reasoningEffort: 'high' });
+  check('agentOptions: full set survives', kept('    agentOptions:\n      provider: p\n      model: m\n      reasoningEffort: low\n      maxTokens: 4096\n'), { provider: 'p', model: 'm', reasoningEffort: 'low', maxTokens: 4096 });
+  check('agentOptions: absent stays undefined', kept(''), undefined);
+
+  // One unknown key makes the whole entry unusable rather than half-applied.
+  truthy('agentOptions: unknown key rejected', why('    agentOptions:\n      reasoningEffort: high\n      bogus: 1\n').includes('unknown fields bogus'));
+  truthy('agentOptions: unknown key zh', whyZh('    agentOptions:\n      reasoningEffort: high\n      bogus: 1\n').includes('未知字段 bogus'));
+  truthy('agentOptions: array rejected', why('    agentOptions: [1, 2]\n').includes('must be an object'));
+  truthy('agentOptions: string rejected', why('    agentOptions: nope\n').includes('must be an object'));
+  truthy('agentOptions: empty object rejected', why('    agentOptions: {}\n').includes('must not be empty'));
+
+  // DSH's own pairing check never fires for a project subagent, so this plugin owns it.
+  truthy('agentOptions: provider alone rejected', why('    agentOptions:\n      provider: p\n').includes('provider and model together'));
+  truthy('agentOptions: model alone rejected', why('    agentOptions:\n      model: m\n').includes('provider and model together'));
+  truthy('agentOptions: pair zh', whyZh('    agentOptions:\n      model: m\n').includes('provider 与 model 必须同时给出'));
+
+  truthy('agentOptions: empty effort rejected', why('    agentOptions:\n      reasoningEffort: ""\n').includes('reasoningEffort must be text'));
+  truthy('agentOptions: numeric effort rejected', why('    agentOptions:\n      reasoningEffort: 3\n').includes('reasoningEffort must be text'));
+  truthy('agentOptions: fractional maxTokens rejected', why('    agentOptions:\n      maxTokens: 1.5\n').includes('maxTokens must be a positive integer'));
+  truthy('agentOptions: zero maxTokens rejected', why('    agentOptions:\n      maxTokens: 0\n').includes('maxTokens must be a positive integer'));
+
+  // A rejected entry is skipped alone; its neighbours load.
+  const both = parseSettings(`subagents:
+  - toolName: good
+    personaFile: g.md
+    agentOptions:
+      reasoningEffort: high
+  - toolName: bad
+    personaFile: b.md
+    agentOptions: {}
+  - toolName: also
+    personaFile: a.md
+`);
+  check('agentOptions: bad entry skipped, others kept', both.settings.subagents.map((s) => s.toolName), ['good', 'also']);
+
+  // backgroundMode is gone from DSH's Config; carrying it is now an unknown field.
+  const bg = sub('    backgroundMode: one-shot\n');
+  check('settings: backgroundMode no longer a field', bg.settings.subagents[0].backgroundMode, undefined);
+  truthy('settings: backgroundMode reported unknown', inLang('en', () => bg.warnings.join('\n')).includes('unknown field "backgroundMode"'));
+
+  // Every named entry reports its name, so N identical warnings stay distinguishable.
+  truthy('settings: subagent unknown field names the entry', whyZh('    backgroundMode: one-shot\n').includes('subagents[0] (a)'));
+  truthy('settings: command unknown field names the entry', inLang('zh', () => parseSettings('commands:\n  - name: hello\n    description: d\n    handlerFile: x.js\n    bogus: 1\n').warnings.join('\n')).includes('commands[0] (hello)'));
 }
 check('expand: ok', expandVars('a ${X} b', { X: '1' }), { value: 'a 1 b' });
 check('expand: missing', expandVars('${X}${Y}', { X: '1' }), { missing: ['Y'] });

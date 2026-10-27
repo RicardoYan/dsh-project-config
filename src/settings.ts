@@ -36,10 +36,11 @@ const SUBAGENT_KEYS = new Set([
   'personaFile',
   'description',
   'provider',
-  'backgroundMode',
   'toolFilter',
   'maxDepth',
+  'agentOptions',
 ])
+const AGENT_OPTION_KEYS = new Set(['provider', 'model', 'reasoningEffort', 'maxTokens'])
 const COMMAND_KEYS = new Set(['name', 'description', 'handlerFile', 'input'])
 const MCP_COMMON = [
   'serverName',
@@ -69,15 +70,23 @@ export interface ToolFilter {
   deny?: string[]
 }
 
+/** One `agentOptions` entry: per-child LLM overrides, all fields optional. */
+export interface AgentOptions {
+  provider?: string
+  model?: string
+  reasoningEffort?: string
+  maxTokens?: number
+}
+
 /** One validated `subagents` entry. */
 export interface SubagentSpec {
   toolName: string
   personaFile: string
   description: string | undefined
   provider: string
-  backgroundMode: string
   toolFilter: ToolFilter | undefined
   maxDepth: number
+  agentOptions: AgentOptions | undefined
 }
 
 /** One validated `commands` entry. */
@@ -192,6 +201,53 @@ function validFilter(f: unknown): f is ToolFilter | undefined {
   )
 }
 
+/**
+ * Why an `agentOptions` value is unusable, or undefined when it is fine.
+ *
+ * Three checks the runtime does NOT make for a project subagent:
+ * - the object must be a plain mapping with no unknown key (DSH's schema is
+ *   `z.object` without `.strict`, so an unknown key would silently ride along);
+ * - `provider` and `model` form one route and must be supplied together. DSH's
+ *   own pairing error lives in `requestedAgentOptions()`, but that function
+ *   returns early unless the model passed `provider`/`model` at call time —
+ *   a project subagent never does, so the check would never fire here. Half a
+ *   route would then inherit the parent's other half and resolve to a route
+ *   that may not exist (`pi-ai provider "x" has no configured model "y"`);
+ * - an empty object is a no-op that still travels to the tool config.
+ */
+function agentOptionsProblem(v: unknown): { zh: string; en: string } | undefined {
+  if (!isObj(v)) return { zh: 'agentOptions 必须是对象', en: 'agentOptions must be an object' }
+  const unknown = Object.keys(v).filter((k) => !AGENT_OPTION_KEYS.has(k))
+  if (unknown.length > 0) {
+    return {
+      zh: `agentOptions 含未知字段 ${unknown.join(', ')}`,
+      en: `agentOptions has unknown fields ${unknown.join(', ')}`,
+    }
+  }
+  if (Object.keys(v).length === 0) {
+    return { zh: 'agentOptions 不能为空', en: 'agentOptions must not be empty' }
+  }
+  for (const k of ['provider', 'model', 'reasoningEffort'] as const) {
+    if (v[k] !== undefined && !isStr(v[k])) {
+      return { zh: `agentOptions.${k} 必须是文字`, en: `agentOptions.${k} must be text` }
+    }
+  }
+  const mt = v['maxTokens']
+  if (mt !== undefined && !isPosInt(mt)) {
+    return {
+      zh: 'agentOptions.maxTokens 必须是正整数',
+      en: 'agentOptions.maxTokens must be a positive integer',
+    }
+  }
+  if ((v['provider'] === undefined) !== (v['model'] === undefined)) {
+    return {
+      zh: 'agentOptions 的 provider 与 model 必须同时给出',
+      en: 'agentOptions needs provider and model together',
+    }
+  }
+  return undefined
+}
+
 function parseSubagents(raw: unknown, p: ParserState): SubagentSpec[] {
   const { warnings } = p
   if (raw === undefined) return []
@@ -218,7 +274,7 @@ function parseSubagents(raw: unknown, p: ParserState): SubagentSpec[] {
       seen.add(toolName)
       return void p.removals.push({ kind: 'subagents', name: toolName, where: w })
     }
-    unknownKeys(e, SUBAGENT_KEYS, where, warnings)
+    unknownKeys(e, SUBAGENT_KEYS, w, warnings)
     const personaFile = e['personaFile']
     if (!isStr(personaFile)) return void warnings.push(skip(w, '缺少 personaFile', 'personaFile is required'))
     if (e['description'] !== undefined && typeof e['description'] !== 'string') {
@@ -227,16 +283,16 @@ function parseSubagents(raw: unknown, p: ParserState): SubagentSpec[] {
     if (e['provider'] !== undefined && !isStr(e['provider'])) {
       return void warnings.push(skip(w, 'provider 必须是文字', 'provider must be text'))
     }
-    if (e['backgroundMode'] !== undefined && !['one-shot', 'continuable'].includes(String(e['backgroundMode']))) {
-      return void warnings.push(
-        skip(w, 'backgroundMode 只能是 one-shot 或 continuable', 'backgroundMode must be one-shot or continuable'),
-      )
-    }
     if (!validFilter(e['toolFilter'])) {
       return void warnings.push(skip(w, 'toolFilter 需要 allow 和/或 deny 列表', 'toolFilter needs allow and/or deny lists'))
     }
     if (e['maxDepth'] !== undefined && !(Number.isSafeInteger(e['maxDepth']) && (e['maxDepth'] as number) >= 0)) {
       return void warnings.push(skip(w, 'maxDepth 必须是非负整数', 'maxDepth must be a non-negative integer'))
+    }
+    const agentOptions = e['agentOptions']
+    if (agentOptions !== undefined) {
+      const bad = agentOptionsProblem(agentOptions)
+      if (bad !== undefined) return void warnings.push(skip(w, bad.zh, bad.en))
     }
     seen.add(toolName)
     out.push({
@@ -244,9 +300,9 @@ function parseSubagents(raw: unknown, p: ParserState): SubagentSpec[] {
       personaFile,
       description: e['description'] as string | undefined,
       provider: (e['provider'] as string | undefined) ?? 'spawn',
-      backgroundMode: (e['backgroundMode'] as string | undefined) ?? 'continuable',
       toolFilter: e['toolFilter'] as ToolFilter | undefined,
       maxDepth: (e['maxDepth'] as number | undefined) ?? 1,
+      agentOptions: agentOptions as AgentOptions | undefined,
     })
   })
   return out
@@ -278,7 +334,7 @@ function parseCommands(raw: unknown, p: ParserState): CommandSpec[] {
       seen.add(name)
       return void p.removals.push({ kind: 'commands', name, where: w })
     }
-    unknownKeys(e, COMMAND_KEYS, where, warnings)
+    unknownKeys(e, COMMAND_KEYS, w, warnings)
     const description = e['description']
     const handlerFile = e['handlerFile']
     if (!isStr(description)) return void warnings.push(skip(w, '缺少 description', 'description is required'))

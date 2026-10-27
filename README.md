@@ -7,7 +7,7 @@ DSH 自带的只读取项目里的 `AGENTS.md` 和 `.dsh/skills/`；子代理、
 ## 安装
 
 ```sh
-dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.3.2
+dsh plugin --profile desktop add github:RicardoYan/dsh-project-config#v0.4.0
 ```
 
 Web 端把 `desktop` 换成你的 profile 名（一般是 `web`）。装完重启 DSH。
@@ -25,6 +25,7 @@ subagents:
   - toolName: code-reviewer              # 成为一个同名工具
     personaFile: agents/code-reviewer.md # 相对工作区根；frontmatter 的 description 用作用途
     toolFilter: { allow: [read, grep, mcp__github__search_code] }
+    agentOptions: { reasoningEffort: high }  # 指定思考档；没写的字段继承主会话
 commands:
   - name: release-notes                # /release-notes
     description: 生成发布说明
@@ -45,6 +46,7 @@ hooks:
 - skill 放 `.dsh/skills/<名字>/SKILL.md`，由 DSH 自己读取
 - 子代理、MCP、hooks 对子代理同样生效；子代理共用主会话的 MCP 连接，按自己的 `toolFilter` 过滤（MCP 工具写全名）
 - 子代理再派项目子代理：把对方的名字写进自己的 `allow`，并且对方的 `maxDepth` 要够（`maxDepth` 是它最多能出现在第几层，主会话直接派的是第 1 层）
+- **按子代理指定模型/思考档**用 `agentOptions`：`provider` / `model` / `reasoningEffort` / `maxTokens`，四个都可选。写哪个就指定哪个，没写的继承主会话——只写 `reasoningEffort` 就只改思考档，模型跟着主会话；要指定模型则 `provider` 和 `model` 必须一起写。详见 [docs/settings.md §3](docs/settings.md#agentoptions)
 - DSH 自带的通用 `subagent` 工具每个子代理都有，`toolFilter` 管不到它，写不写都一样；嵌套层数由 DSH 的子代理层数上限控制
 - `/project-config` 查看本会话加载了什么、哪些被跳过及原因，以及每个 MCP 服务器的连接状态；`/project-config reconnect [名字]` 在当前会话里重连 MCP 服务器（不带名字只重连没连上的；状态是「跳过」的服务器没有连接，重连会说明原因，需要改配置后新开会话）
 
