@@ -233,14 +233,14 @@ interface Generation {
 }
 
 /** A resource request, as `ctx.mcpResources` forwards one. */
-interface ResourceRequest {
+export interface ResourceRequest {
   method: string
   cursor?: string
   uri: string
 }
 
 /** Resource execution context. */
-interface ResourceExec {
+export interface ResourceExec {
   signal: AbortSignal
 }
 

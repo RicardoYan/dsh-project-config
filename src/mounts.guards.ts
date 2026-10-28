@@ -24,6 +24,22 @@ export interface Disposable {
  */
 export type FeatureMount = Disposable | undefined
 
+/**
+ * The three feature sections `doMountFeatures` mounts and `/project-config
+ * reload <part>` re-mounts one at a time. Subagent tools are not among them:
+ * they belong to `RootMount.subagentFiber` (`createRootMount`).
+ */
+export type FeatureKind = 'commands' | 'mcp' | 'hooks'
+
+/** One feature section's fiber, tagged so a single section can be replaced. */
+export interface TaggedFeature {
+  kind: FeatureKind
+  fiber: FeatureMount
+}
+
+/** One section `/project-config reload <part>` re-mounts on its own. */
+export type ReloadPart = 'subagents' | FeatureKind
+
 /** One listener registered on a session scope, removed on release. */
 export type Unsubscribe = () => void
 
@@ -64,10 +80,12 @@ export interface RootMount {
   removed: Removal[] | undefined
   subagentSpecs: LoadedSpec[]
   subagentNames: Set<string>
+  /** The subagent tools' fiber; the same object also sits in `fibers`. */
+  subagentFiber: FeatureMount
   children: Set<ChildMount>
   fibers: Array<FeatureMount>
-  /** Commands, MCP and hooks; mounted once, after the settings are read. */
-  features: Array<FeatureMount>
+  /** Commands, MCP and hooks, tagged so `reload <part>` can replace one section. */
+  features: Array<TaggedFeature>
   listeners: Unsubscribe[]
   hub: McpHub | undefined
   featuresMounted: boolean
@@ -84,8 +102,8 @@ export interface ChildMount {
   toolName: string | undefined
   filter: { allow?: string[]; deny?: string[] } | undefined
   fibers: Array<FeatureMount>
-  /** MCP mirror and hooks, mounted once the root's features are up. */
-  features: Array<FeatureMount>
+  /** MCP mirror and hooks, tagged so one section can be replaced on reload. */
+  features: Array<TaggedFeature>
   subagents: Array<{ entry: SubagentSpec; persona: string; description: string | undefined }>
   featuresMounted?: boolean
   released?: boolean

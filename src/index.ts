@@ -23,17 +23,17 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createLog, type Log } from './log.js'
 import { findRoot, checkTarget } from './workspace.js'
 import { splitPersona, type McpSpec } from './settings.js'
-import { loadProjectSettings } from './project-settings.js'
+import { loadProjectSettings, type LoadResult } from './project-settings.js'
 import { patchSkillRoots, installInstructionsMarker } from './isolation.js'
 import { admits, applyChildRole, delegationStore, mountSubagentTools } from './features/subagents.js'
-import { McpHub, resolveServerConfig, SkippedServer } from './features/mcp.js'
+import { McpHub, resolveServerConfig } from './features/mcp.js'
 import { mountHooks, runLifecycleHook } from './features/hooks.js'
 import { mountCommands } from './features/commands.js'
-import { reconnectText, statusText } from './status.js'
+import { mcpStateText, statusText } from './status.js'
 import { TEXT } from './text.js'
 import type { Text } from './locale.js'
 import { preferenceFromLoader, setLocaleSource } from './locale.js'
-import type { ChildMount, FeatureMount, LoadedSpec, Mount, RootMount, Unsubscribe } from './mounts.guards.js'
+import type { ChildMount, FeatureKind, FeatureMount, LoadedSpec, Mount, ReloadPart, RootMount, TaggedFeature, Unsubscribe } from './mounts.guards.js'
 
 export const name = 'dsh-project-config'
 const PERSONA_MAX = 1024 * 1024
@@ -211,6 +211,7 @@ export function apply(ctx: Context): void {
       removed: loaded.removed,
       subagentSpecs: [],
       subagentNames: new Set(),
+      subagentFiber: undefined,
       children: new Set(),
       fibers: claim.fibers,
       features: [],
@@ -230,14 +231,14 @@ export function apply(ctx: Context): void {
     const ok = await loadSpecs(m, m.settings.subagents)
     if (claim.released) return m
     m.subagentSpecs = ok
-    m.fibers.push(
-      mountSubagentTools(agent.ctx, ok, {
-        log,
-        label,
-        isProjectName: isProjectNameFor(m),
-        sectionName: 'project-config:subagents',
-      }),
-    )
+    const subagentFiber = mountSubagentTools(agent.ctx, ok, {
+      log,
+      label,
+      isProjectName: isProjectNameFor(m),
+      sectionName: 'project-config:subagents',
+    })
+    m.subagentFiber = subagentFiber
+    if (subagentFiber !== undefined) m.fibers.push(subagentFiber)
     for (const w of m.warnings) log.warn(`${label}: ${w}`)
     log.info(
       `${label}: loaded ${loaded.file}${loaded.localFile ? ` + ${path.basename(loaded.localFile)}` : ''} (subagents ${ok.length}, commands ${m.settings.commands.length}, mcp ${m.settings.mcp.length}, hook events ${Object.keys(m.settings.hooks).length})`,
@@ -258,42 +259,80 @@ export function apply(ctx: Context): void {
     )
   }
 
+  /** Record one section's fiber so `reload <part>` can replace exactly that one. */
+  function addFeature(m: RootMount, kind: FeatureKind, fiber: FeatureMount): void {
+    m.features.push({ kind, fiber })
+  }
+
   async function doMountFeatures(m: RootMount): Promise<void> {
-    const created: Array<FeatureMount> = []
+    await mountCommandsFeature(m)
+    mountMcpFeature(m)
+    mountHooksFeature(m)
+    for (const w of m.warnings) log.warn(`${m.label}: ${w}`)
+    for (const child of m.children) mountChildFeatures(child)
+    log.info(`${m.label}: features mounted`)
+  }
+
+  async function mountCommandsFeature(m: RootMount): Promise<void> {
     const agentCtx = (m.agent as { ctx: Context }).ctx
-    // commands
     const cmdSpecs: Array<{ entry: import('./settings.js').CommandSpec; realPath: string }> = []
     for (const entry of m.settings.commands) {
       const checked = await checkTarget(m.root, entry.handlerFile, { type: 'file' })
       if (checked.ok) cmdSpecs.push({ entry, realPath: checked.realPath })
       else m.warnings.push(TEXT.commandProblem(entry.name, checked.message) as Text)
     }
-    created.push(mountCommands(agentCtx, cmdSpecs, { root: m.root, log, label: m.label }))
-    // MCP
-    if (m.settings.mcp.length > 0) {
-      m.hub = new McpHub(log, m.label)
-      created.push(
-        m.hub.start(agentCtx, m.settings.mcp, (entry: McpSpec) =>
-          resolveServerConfig(entry, m.root, checkTarget),
-        ),
-      )
-    }
-    // hooks
-    created.push(mountHooks(agentCtx, hookOpts(m)))
-    m.features.push(...created)
-    for (const w of m.warnings) log.warn(`${m.label}: ${w}`)
-    for (const child of m.children) mountChildFeatures(child)
-    log.info(`${m.label}: features mounted`)
+    addFeature(m, 'commands', mountCommands(agentCtx, cmdSpecs, { root: m.root, log, label: m.label }))
   }
 
-  function unmountFeatures(m: RootMount): Promise<unknown> {
+  function mountMcpFeature(m: RootMount): void {
+    if (m.settings.mcp.length === 0) return
+    const agentCtx = (m.agent as { ctx: Context }).ctx
+    const hub = new McpHub(log, m.label)
+    m.hub = hub
+    addFeature(
+      m,
+      'mcp',
+      hub.start(agentCtx, m.settings.mcp, (entry: McpSpec) => resolveServerConfig(entry, m.root, checkTarget)),
+    )
+  }
+
+  function mountHooksFeature(m: RootMount): void {
+    addFeature(m, 'hooks', mountHooks((m.agent as { ctx: Context }).ctx, hookOpts(m)))
+  }
+
+  /** Dispose the tag's fibers; `kind` selects one section, `undefined` all of them. */
+  function disposeFeatures(m: RootMount, kind?: FeatureKind): Promise<unknown> {
+    const taken: Array<TaggedFeature> = []
+    for (let i = m.features.length - 1; i >= 0; i -= 1) {
+      const entry = m.features[i] as TaggedFeature
+      if (kind !== undefined && entry.kind !== kind) continue
+      taken.push(...m.features.splice(i, 1))
+    }
+    return Promise.all(taken.map((f) => disposeFiber(f.fiber, log)))
+  }
+
+  async function unmountFeatures(m: RootMount): Promise<unknown> {
     if (!m.featuresMounted) return Promise.resolve()
     m.featuresMounted = false
-    const pending: Array<Promise<unknown>> = m.features.splice(0).map((f) => disposeFiber(f, log))
+    const pending: Array<Promise<unknown>> = [disposeFeatures(m)]
     m.hub = undefined
     for (const child of m.children) pending.push(unmountChildFeatures(child))
     log.info(`${m.label}: features removed`)
     return Promise.all(pending)
+  }
+
+  /**
+   * Take out one section so it can be mounted again: waits for the fibers to be
+   * gone (the registry throws on a name that is still registered) and drops the
+   * servers that section started.
+   * @param kinds - which sections to remove.
+   */
+  async function unmountSections(m: RootMount, ...kinds: FeatureKind[]): Promise<void> {
+    for (const kind of kinds) {
+      await disposeFeatures(m, kind)
+      if (kind === 'mcp') m.hub = undefined
+      for (const child of m.children) await unmountChildFeatures(child, kind)
+    }
   }
 
   // ------------------------------------------------------------ child sessions
@@ -388,18 +427,33 @@ export function apply(ctx: Context): void {
     return child
   }
 
-  function mountChildFeatures(child: ChildMount): void {
-    if (child.featuresMounted === true) return
-    child.featuresMounted = true
+  /**
+   * Mount a child's feature sections; `kind` limits it to one, `undefined` mounts
+   * every section that is not there yet (so calling it again is how a section is
+   * put back after `reload mcp` / `reload hooks`).
+   */
+  function mountChildFeatures(child: ChildMount, kind?: FeatureKind): void {
     const m = child.rootMount
-    if (m.hub !== undefined) child.features.push(m.hub.mirror((child.agent as AgentLike).ctx, child.filter))
-    child.features.push(mountHooks((child.agent as AgentLike).ctx, hookOpts(m)))
+    const mounted = (k: FeatureKind): boolean => child.features.some((f) => f.kind === k)
+    if ((kind === undefined || kind === 'mcp') && m.hub !== undefined && !mounted('mcp')) {
+      child.features.push({ kind: 'mcp', fiber: m.hub.mirror((child.agent as AgentLike).ctx, child.filter) })
+    }
+    if ((kind === undefined || kind === 'hooks') && !mounted('hooks')) {
+      child.features.push({ kind: 'hooks', fiber: mountHooks((child.agent as AgentLike).ctx, hookOpts(m)) })
+    }
+    child.featuresMounted = true
   }
 
-  function unmountChildFeatures(child: ChildMount): Promise<unknown> {
-    if (child.featuresMounted !== true) return Promise.resolve()
-    child.featuresMounted = false
-    return Promise.all(child.features.splice(0).map((f) => disposeFiber(f, log)))
+  /** Remove a child's features; `kind` selects one section, `undefined` all of them. */
+  function unmountChildFeatures(child: ChildMount, kind?: FeatureKind): Promise<unknown> {
+    const taken: Array<TaggedFeature> = []
+    for (let i = child.features.length - 1; i >= 0; i -= 1) {
+      const entry = child.features[i] as TaggedFeature
+      if (kind !== undefined && entry.kind !== kind) continue
+      taken.push(...child.features.splice(i, 1))
+    }
+    if (kind === undefined) child.featuresMounted = false
+    return Promise.all(taken.map((f) => disposeFiber(f.fiber, log)))
   }
 
   // ------------------------------------------------------------ release
@@ -424,7 +478,10 @@ export function apply(ctx: Context): void {
     // and no hub; `fibers` is shared with the mount being built, so whatever it
     // already pushed is disposed here.
     const pending: Array<Promise<unknown>> = [unmountFeatures(m)]
-    for (const f of m.fibers.splice(0)) pending.push(disposeFiber(f, log))
+    // `fibers` also holds `subagentFiber`: the subagent tools go away with the mount.
+    const fibers = m.fibers.splice(0)
+    m.subagentFiber = undefined
+    for (const f of fibers) pending.push(disposeFiber(f, log))
     for (const off of (m.listeners ?? []).splice(0)) {
       try {
         off()
@@ -450,6 +507,41 @@ export function apply(ctx: Context): void {
     return sessions === undefined || sessions.get(agent.id) === agent.session
   }
 
+  /**
+   * Read a session's settings and mount both stages on it.
+   *
+   * The claim is taken BEFORE the first await: `agent/created` reaches
+   * `onCreated` once per emission, and a plugin reload also re-runs it for every
+   * live agent; two runs used to pass the `mounts.has` check, both read the
+   * settings, and both mount the same tools — the second `tools.register` then
+   * throws `tool "<name>" is already registered in this scope`, which DSH treats
+   * as a fatal load failure (the whole host exits). The slot holds nothing yet,
+   * so the failure paths below clear it again.
+   * @param agent - the root session's agent; its `mounts` slot must be free.
+   * @returns the new mount, or `undefined` when there is nothing to mount.
+   */
+  async function attachRoot(agent: AgentLike): Promise<RootMount | undefined> {
+    const claim: Claim = { agent, pending: true, fibers: [], released: false }
+    mounts.set(agent, claim)
+    const m = await createRootMount(agent, claim)
+    if (m === undefined) {
+      mounts.delete(agent)
+      return undefined
+    }
+    claim.pending = false
+    mounts.set(agent, m)
+    roots.add(m)
+    // Gone while the settings were read: plugin unloaded, agent disposed or session removed.
+    const agents = ctx.get('agents') as { get(id: string): AgentLike | undefined } | undefined
+    if (!active || !isLive(agent) || agents?.get(agent.id) !== agent) {
+      await releaseRoot(m)
+      return undefined
+    }
+    if (m.ok) installFirstAssembly(m)
+    await mountFeatures(m)
+    return m.released === true ? undefined : m
+  }
+
   async function onCreated(agent: AgentLike, source: string): Promise<void> {
     if (!active || mounts.has(agent) || !isLive(agent)) return
     const header = agent.session.header
@@ -462,32 +554,8 @@ export function apply(ctx: Context): void {
       }
       return
     }
-    // Claim the agent BEFORE the first await. `agent/created` reaches this
-    // function once per emission, and a plugin reload also re-runs it for every
-    // live agent; two runs used to pass the `mounts.has` check, both read the
-    // settings, and both mount the same tools — the second `tools.register`
-    // then throws `tool "<name>" is already registered in this scope`, which
-    // DSH treats as a fatal load failure (the whole host exits). The slot holds
-    // nothing yet, so the failure paths below clear it again.
-    const claim: Claim = { agent, pending: true, fibers: [], released: false }
-    mounts.set(agent, claim)
-    const m = await createRootMount(agent, claim)
-    if (m === undefined) {
-      mounts.delete(agent)
-      return
-    }
-    claim.pending = false
-    mounts.set(agent, m)
-    roots.add(m)
-    // Gone while the settings were read: plugin unloaded, agent disposed or session removed.
-    const agents = ctx.get('agents') as { get(id: string): AgentLike | undefined } | undefined
-    if (!active || !isLive(agent) || agents?.get(agent.id) !== agent) {
-      await releaseRoot(m)
-      return
-    }
-    if (m.ok) installFirstAssembly(m)
-    await mountFeatures(m)
-    if (m.released === true) return
+    const m = await attachRoot(agent)
+    if (m === undefined) return
     runLifecycleHook(ctx, hookOpts(m), 'agent/created', agent as never, { source }).catch(() => {})
   }
 
@@ -583,9 +651,230 @@ export function apply(ctx: Context): void {
     }
   }
 
-  // /project-config            status (connected MCP servers are pinged first)
-  // /project-config reconnect  reconnect every MCP server that is not connected
-  // /project-config reconnect <server>  reconnect that one, whatever its state
+  // ------------------------------------------------------------ /project-config reload
+  const ALL_PARTS: readonly ReloadPart[] = ['subagents', 'commands', 'mcp', 'hooks']
+
+  /** What one `reload` run produced: per-section counts, and the sections that failed. */
+  interface ReloadReport {
+    counts: Record<ReloadPart, number>
+    failures: string[]
+    /** Sections whose settings changed but were left alone by a single-section reload. */
+    stale: ReloadPart[]
+    /** The workspace settings are gone: nothing is mounted any more. */
+    gone?: boolean
+  }
+
+  /**
+   * Re-read the workspace settings and replace the requested sections of `m`.
+   *
+   * Everything is mounted on `agent.ctx`, which the plugin fiber does not own,
+   * so each section is disposed here before its replacement is mounted —
+   * `commands.register`, `systemPrompt.section` and `tools.register` all throw on
+   * a name that is still registered, and the tool layer throws in a way DSH
+   * treats as a fatal load failure.
+   * @param m - the live root mount; it is released and replaced on a full reload.
+   * @param parts - the sections to re-mount, in report order.
+   * @param mcpName - when given, only this MCP server is restarted.
+   * @returns the counts, the failures, and the sections left stale.
+   */
+  async function reloadRoot(m: RootMount, parts: readonly ReloadPart[], mcpName?: string): Promise<ReloadReport> {
+    const all = parts.length === ALL_PARTS.length
+    const agent = m.agent as AgentLike
+    const children = [...m.children]
+    if (all) {
+      // The whole mount goes: settings, subagent tools, features, listeners.
+      // `releaseRoot` also clears `mounts`, without which `attachRoot` would see
+      // its own slot taken and mount nothing.
+      await releaseRoot(m)
+      const fresh = await attachRoot(agent)
+      if (fresh === undefined) return { counts: zeroCounts(), failures: [], stale: [], gone: true }
+      // The children keep their own tools and persona; only their mirror and
+      // hooks are re-pointed at the new root (`releaseRoot` unmounted them).
+      for (const child of children) {
+        child.rootMount = fresh
+        fresh.children.add(child)
+        mountChildFeatures(child)
+      }
+      return { counts: countsOf(fresh), failures: [], stale: [] }
+    }
+    const loaded = await loadProjectSettings(m.root)
+    if (loaded === undefined) return { counts: zeroCounts(), failures: [], stale: [], gone: true }
+    // A settings file that no longer parses has no sections to mount: report it
+    // and leave the running mount alone. Writing `ok: false` onto it would leave
+    // `mountFeatures` skipped and the status showing an error while the old
+    // sections are still mounted.
+    if (!loaded.ok) return { counts: countsOf(m), failures: [String(loaded.error)], stale: [] }
+    const stale = ALL_PARTS.filter((p) => !parts.includes(p) && changed(m, loaded, p))
+    for (const part of parts) applySettings(m, loaded, part)
+    const failures: string[] = []
+    for (const part of parts) {
+      try {
+        if (part === 'subagents') {
+          await remountSubagents(m)
+          continue
+        }
+        if (part === 'mcp') {
+          await remountMcp(m, mcpName)
+          for (const child of m.children) mountChildFeatures(child, 'mcp')
+          continue
+        }
+        await unmountSections(m, part)
+        if (part === 'commands') await mountCommandsFeature(m)
+        else mountHooksFeature(m)
+        // The children lost this section when it was unmounted; put it back so a
+        // reload never leaves a running subagent without its tools or hooks.
+        for (const child of m.children) mountChildFeatures(child)
+      } catch (error) {
+        log.warn(`${m.label}: reload ${part} failed: ${errMessage(error)}`)
+        failures.push(`${part}: ${errMessage(error)}`)
+      }
+    }
+    return { counts: countsOf(m), failures, stale }
+  }
+
+  function zeroCounts(): Record<ReloadPart, number> {
+    return { subagents: 0, commands: 0, mcp: 0, hooks: 0 }
+  }
+
+  /** What is mounted right now, for the reload report. */
+  function countsOf(m: RootMount): Record<ReloadPart, number> {
+    return {
+      subagents: m.subagentSpecs.length,
+      commands: m.features.some((f) => f.kind === 'commands') ? m.settings.commands.length : 0,
+      mcp: m.hub === undefined ? 0 : m.hub.servers.size,
+      hooks: Object.keys(m.settings.hooks).length,
+    }
+  }
+
+  /** Whether `part`'s entries differ between what is mounted and what was just read. */
+  function changed(m: RootMount, loaded: LoadResult, part: ReloadPart): boolean {
+    if (part === 'hooks') return JSON.stringify(m.settings.hooks) !== JSON.stringify(loaded.settings.hooks)
+    const before = m.settings[part] as ReadonlyArray<unknown>
+    const after = loaded.settings[part] as ReadonlyArray<unknown>
+    return JSON.stringify(before) !== JSON.stringify(after)
+  }
+
+  /** Copy one section of the freshly read settings over the mount's, in place. */
+  function applySettings(m: RootMount, loaded: LoadResult, part: ReloadPart): void {
+    m.file = loaded.file
+    m.localFile = loaded.localFile
+    m.ok = loaded.ok
+    m.error = loaded.error
+    m.origin = loaded.origin
+    m.hooksLocal = loaded.hooksLocal
+    m.removed = loaded.removed
+    // The warnings describe the settings that were just read, not the ones that
+    // were mounted before: replace them before adding this section's own.
+    m.warnings = [...loaded.warnings]
+    if (part === 'hooks') {
+      m.settings = { ...m.settings, hooks: loaded.settings.hooks }
+      // The counters describe the hooks that are mounted; those are replaced.
+      m.stats.runs = 0
+      m.stats.failures = 0
+      return
+    }
+    m.settings = { ...m.settings, [part]: loaded.settings[part] } as typeof m.settings
+  }
+
+  /** Re-read the subagent tools: dispose the one fiber, load the specs again, mount them. */
+  async function remountSubagents(m: RootMount): Promise<void> {
+    const fiber = m.subagentFiber
+    m.subagentFiber = undefined
+    const at = fiber === undefined ? -1 : m.fibers.indexOf(fiber)
+    if (at >= 0) m.fibers.splice(at, 1)
+    await disposeFiber(fiber, log)
+    m.subagentNames = new Set(m.settings.subagents.map((s) => s.toolName))
+    const ok = await loadSpecs(m, m.settings.subagents)
+    m.subagentSpecs = ok
+    const mounted = mountSubagentTools((m.agent as { ctx: Context }).ctx, ok, {
+      log,
+      label: m.label,
+      isProjectName: isProjectNameFor(m),
+      sectionName: 'project-config:subagents',
+    })
+    m.subagentFiber = mounted
+    // `undefined` when the new settings list no subagent at all: pushing it would
+    // leave an empty slot behind and grow `fibers` on every such reload.
+    if (mounted !== undefined) m.fibers.push(mounted)
+  }
+
+  /**
+   * Rebuild the MCP section. Without a name every server is dropped and started
+   * again from the freshly read settings; with one, only that server's
+   * connection is replaced and the others are left running.
+   */
+  async function remountMcp(m: RootMount, name?: string): Promise<void> {
+    if (name === undefined) {
+      await unmountSections(m, 'mcp')
+      mountMcpFeature(m)
+      if (m.hub !== undefined) await withTimeout(m.hub.ready, 10_000)
+      return
+    }
+    const entry = m.settings.mcp.find((e) => e.serverName === name)
+    if (entry === undefined) throw new Error(String(TEXT.reloadMcpUnknown(name, m.settings.mcp.map((e) => e.serverName).join(', '))))
+    // The session was mounted before this workspace configured any MCP server
+    // (or every entry was rejected then): bring the section up first, so naming
+    // one server is enough to add it.
+    if (m.hub === undefined) {
+      mountMcpFeature(m)
+      const started = m.hub as McpHub | undefined
+      if (started !== undefined) await withTimeout(started.ready, 10_000)
+      return
+    }
+    await m.hub.restart(entry, (e: McpSpec) => resolveServerConfig(e, m.root, checkTarget))
+  }
+
+  /**
+   * Render one reload report: the counts, the failures, and what was left stale.
+   *
+   * Every result here is MULTI-LINE on purpose. The transcript renders a command
+   * result through `GenericCommandCard`, whose
+   * `body = text.includes("\n") ? text : null` decides whether the row can be
+   * expanded at all; a one-line result is forced into a single `nowrap` line with
+   * `text-overflow: ellipsis` and can never be opened, however long it is. So a
+   * per-section report lists one entry per line instead of joining them with
+   * commas.
+   */
+  function reloadReportText(report: ReloadReport, m: RootMount, parts: readonly ReloadPart[]): string {
+    if (report.gone === true) return String(TEXT.reloadSettingsGone)
+    if (parts.length === 1) {
+      const part = parts[0] as ReloadPart
+      if (report.failures.length > 0) {
+        return `${String(TEXT.reloadPartFailed(part))}${report.failures.join('\n')}`
+      }
+      const lines = linesOf(m, part)
+      return `${String(TEXT.reloadPartDone(part, lines.length))}${lines.length > 0 ? lines.join('\n') : '—'}`
+    }
+    const head =
+      report.failures.length === 0
+        ? String(TEXT.reloadDone(report.counts))
+        : `${String(TEXT.reloadPartial(parts.join(', ')))}${report.failures.join('\n')}`
+    if (report.stale.length === 0) return head
+    return `${head}\n${String(TEXT.reloadStale(report.stale.join(', ')))}`
+  }
+
+  /** One line per entry a section currently holds, `reload <part>` reports them. */
+  function linesOf(m: RootMount, part: ReloadPart): string[] {
+    switch (part) {
+      case 'subagents':
+        return m.subagentSpecs.map((s) => s.entry.toolName)
+      case 'commands':
+        return m.settings.commands.map((c) => `/${c.name}`)
+      case 'mcp': {
+        // Per-server state, one line each: a reload that left a server down must
+        // say so here, not in a count taken before the connections settled.
+        const names = [...(m.hub?.servers.keys() ?? [])]
+        return names.length === 0 ? [] : mcpStateText(m as never, names).split('\n')
+      }
+      case 'hooks':
+        return Object.keys(m.settings.hooks)
+    }
+  }
+
+  // /project-config                    status (connected MCP servers are pinged first)
+  // /project-config reload             re-mount everything
+  // /project-config reload <part>     re-mount one section
+  // /project-config reload mcp <name>  rebuild one server's connection
   async function runCommand(invocation: {
     agent?: AgentLike
     rawInput?: unknown
@@ -597,43 +886,40 @@ export function apply(ctx: Context): void {
       .trim()
       .split(/\s+/)
       .filter(Boolean)
-    const status = (): string => statusText(mount as never, { logFile: log.file })
     if (args.length === 0) {
       if (root?.hub !== undefined) await withTimeout(root.hub.checkAll(), 6000)
-      return { kind: 'success', text: status() }
+      return { kind: 'success', text: statusText(mount as never, { logFile: log.file }) }
     }
-    if (args[0] !== 'reconnect' || args.length > 2) return { kind: 'error', text: String(TEXT.commandUsage) }
+    // A word that is not `reload` names what was refused, so `reconnect` (the
+    // old subcommand, now gone) says so instead of printing the whole usage with
+    // no hint of what went wrong.
+    if (args[0] !== 'reload') {
+      return { kind: 'error', text: `${String(TEXT.unknownArg(args[0] as string))}\n\n${String(TEXT.commandUsage)}` }
+    }
+    if (args.length > 3) return { kind: 'error', text: String(TEXT.commandUsage) }
+    const words = ALL_PARTS as readonly string[]
+    if (args[1] !== undefined && !words.includes(args[1])) {
+      return { kind: 'error', text: String(TEXT.reloadUnknownPart(args[1])) }
+    }
+    if (args[2] !== undefined && args[1] !== 'mcp') return { kind: 'error', text: String(TEXT.commandUsage) }
     if (mount === undefined) return { kind: 'error', text: String(TEXT.noSettings) }
-    if (root?.hub === undefined) {
-      return { kind: 'error', text: String(TEXT.reconnectNoMcp) }
-    }
-    const hub = root.hub
-    let done: string[] | undefined
+    if (root === undefined) return { kind: 'error', text: String(TEXT.noSettings) }
+    const parts: readonly ReloadPart[] = args[1] === undefined ? ALL_PARTS : [args[1] as ReloadPart]
+    let report: ReloadReport
     try {
-      done = await hub.reconnect(args[1] as string)
+      report = await reloadRoot(root, parts, args[2])
     } catch (error) {
-      if (!(error instanceof SkippedServer)) throw error
-      log.warn(`${root.label}: ${error.message}`)
-      return { kind: 'error', text: String(TEXT.reconnectSkipped(error.server, error.reason)) }
+      log.warn(`${root.label}: reload failed: ${errMessage(error)}`)
+      return { kind: 'error', text: String(TEXT.reloadPartial(errMessage(error))) }
     }
-    if (done === undefined) {
-      return {
-        kind: 'error',
-        text: String(TEXT.reconnectUnknown(args[1] as string, [...hub.servers.keys()].join(', '))),
-      }
+    log.info(`${root.label}: reload ${parts.join('+')} -> ${JSON.stringify(report.counts)}`)
+    // `reloadRoot` replaced the mount on a full reload; report off the new one.
+    const after = invocation.agent === undefined ? undefined : mounts.get(invocation.agent)
+    const shown = (after as RootMount | undefined) ?? root
+    return {
+      kind: report.failures.length === 0 ? 'success' : 'error',
+      text: reloadReportText(report, shown, parts),
     }
-    if (done.length === 0) {
-      // Nothing was reconnected. When the only servers that are not connected
-      // were skipped at mount time, "everything is connected" would be a lie.
-      const skipped = hub.skippedServers()
-      if (skipped.length > 0) {
-        const list = skipped.map((s) => `${s.name} (${s.reason ?? '—'})`).join(', ')
-        return { kind: 'error', text: String(TEXT.reconnectAllSkipped(list)) }
-      }
-      return { kind: 'success', text: String(TEXT.reconnectNothing) }
-    }
-    log.info(`${root.label}: reconnect ${done.join(', ')}`)
-    return { kind: 'success', text: reconnectText(root as never, done) }
   }
 
   ctx.inject(['commands'], (c) => {
@@ -641,7 +927,7 @@ export function apply(ctx: Context): void {
       name: 'project-config',
       // Read once at registration: follows the language DSH started with.
       description: String(TEXT.commandDescription),
-      input: { hint: '[reconnect [<MCP>]]' },
+      input: { hint: '[reload [subagents|commands|mcp [<MCP>]|hooks]]' },
       handler: (invocation: { agent?: AgentLike; rawInput?: unknown }) => runCommand(invocation),
     } as never)
   })

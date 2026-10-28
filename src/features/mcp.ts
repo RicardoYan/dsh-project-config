@@ -2,7 +2,7 @@
 //
 // Connections are owned here (features/mcp-connection.ts) rather than by the
 // official dsh-mcp-client plugin, which keeps its connection state private:
-// /project-config shows the real state and `/project-config reconnect` restarts
+// /project-config shows the real state and `/project-config reload mcp` restarts
 // a server in the running session.
 // Tools are registered on the root agent's scope (`ctx.tools.register`) and
 // mirrored into subagent scopes, where calls still go through the root's
@@ -14,7 +14,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Text } from '../locale.js'
 import { expandVars, type McpSpec } from '../settings.js'
 import { TEXT } from '../text.js'
-import { McpConnection, DEFAULT_HEALTH_CHECK_MS, type ServerConfig } from './mcp-connection.js'
+import { McpConnection, DEFAULT_HEALTH_CHECK_MS, type ResourceExec, type ResourceRequest, type ServerConfig } from './mcp-connection.js'
 import { admits } from './subagents.js'
 
 const MASK = '***'
@@ -181,6 +181,10 @@ export class McpHub {
   ready: Promise<void> = Promise.resolve()
   disposed = false
   scheduled = false
+  /** The scope `start()` mounted into; `restart` mounts a replaced server here. */
+  scope: Context | undefined = undefined
+  /** The connection options `start()` was given, reused by `restart`. */
+  connectionOpts: Record<string, unknown> = {}
 
   constructor(log: HubLog, label: string) {
     this.log = log
@@ -201,7 +205,11 @@ export class McpHub {
     this.ready = new Promise<void>((r) => {
       release = r
     })
+    this.connectionOpts = connectionOpts
     return agentCtx.inject(['tools'], (c) => {
+      // Kept so `restart` can mount a server later on the same scope: the fiber
+      // it belongs to is the one created here.
+      this.scope = c
       c.effect(() => () => this.disposeAll(), 'project-config: mcp connections')
       void this.startIn(c, entries, resolveEntry, connectionOpts).then(release, release)
     }) as unknown as { dispose(): unknown } | undefined
@@ -213,68 +221,109 @@ export class McpHub {
     resolveEntry: (entry: McpSpec) => Promise<ResolvedServer>,
     connectionOpts: Record<string, unknown> = {},
   ): Promise<void> {
-    const pending = entries.map(async (entry) => {
-      const name = entry.serverName
-      const record: ServerRecord = { connection: undefined, skipped: undefined }
-      this.servers.set(name, record)
-      const resolved = await resolveEntry(entry)
-      if (this.disposed) return
-      if ('error' in resolved) {
-        record.skipped = String(resolved.error)
-        this.log.warn(`${this.label}: mcp ${name} skipped: ${record.skipped}`)
-        return
-      }
-      // Errors may quote the url or echo a header (an HTTP error body, a server
-      // message): mask before they reach the log or the status.
-      const secrets = secretsOf(resolved.config)
-      const clean = (t: string): string => redact(t, secrets)
-      let connection: McpConnection
-      try {
-        connection = new McpConnection(resolved.config, {
-          ctx: c,
-          register: (definition) =>
-            this.track(definition as ToolDefinition, (d) => (c.tools as unknown as ToolsLike).register(d)),
-          log: {
-            info: (t: string) => this.log.info(`${this.label}: ${clean(t)}`),
-            warn: (t: string) => this.log.warn(`${this.label}: ${clean(t)}`),
-          },
-          clean,
-          healthCheckMs: DEFAULT_HEALTH_CHECK_MS,
-          ...connectionOpts,
-        })
-      } catch (error) {
-        record.skipped = String((error as { message?: unknown } | undefined)?.message ?? error)
-        this.log.warn(`${this.label}: mcp ${name} skipped: ${record.skipped}`)
-        return
-      }
-      record.connection = connection
-      // Both services are optional: a composition without them keeps the tools.
-      ;(c as unknown as {
-        inject?(deps: string[], cb: (inner: { mcpResources: { register(n: string, r: unknown): void } }) => void): void
-      }).inject?.(['mcpResources'], (inner) => {
-        inner.mcpResources.register(name, connection.resources)
-      })
-      ;(c as unknown as {
-        inject?(
-          deps: string[],
-          cb: (inner: {
-            systemPrompt: {
-              section(o: { name: string; order: number; interpolate: boolean; text: () => string }): void
-              getSectionOrder(n: string): number
-            }
-          }) => void,
-        ): void
-      }).inject?.(['systemPrompt'], (inner) => {
-        inner.systemPrompt.section({
-          name: `mcp:${name}`,
-          order: inner.systemPrompt.getSectionOrder('MCP_SERVERS'),
-          interpolate: false,
-          text: () => connection.instructions,
-        })
-      })
-      await connection.start()
-    })
+    this.connectionOpts = connectionOpts
+    const pending = entries.map((entry) => this.startServer(c, entry, resolveEntry, connectionOpts))
     return Promise.allSettled(pending).then(() => {})
+  }
+
+  /** Resolve one entry and bring its connection up; records skipped ones instead of throwing. */
+  async startServer(
+    c: Context,
+    entry: McpSpec,
+    resolveEntry: (entry: McpSpec) => Promise<ResolvedServer>,
+    connectionOpts: Record<string, unknown> = {},
+  ): Promise<void> {
+    const name = entry.serverName
+    const record: ServerRecord = { connection: undefined, skipped: undefined }
+    this.servers.set(name, record)
+    const resolved = await resolveEntry(entry)
+    if (this.disposed) return
+    if ('error' in resolved) {
+      record.skipped = String(resolved.error)
+      this.log.warn(`${this.label}: mcp ${name} skipped: ${record.skipped}`)
+      return
+    }
+    // Errors may quote the url or echo a header (an HTTP error body, a server
+    // message): mask before they reach the log or the status.
+    const secrets = secretsOf(resolved.config)
+    const clean = (t: string): string => redact(t, secrets)
+    let connection: McpConnection
+    try {
+      connection = new McpConnection(resolved.config, {
+        ctx: c,
+        register: (definition) =>
+          this.track(definition as ToolDefinition, (d) => (c.tools as unknown as ToolsLike).register(d)),
+        log: {
+          info: (t: string) => this.log.info(`${this.label}: ${clean(t)}`),
+          warn: (t: string) => this.log.warn(`${this.label}: ${clean(t)}`),
+        },
+        clean,
+        healthCheckMs: DEFAULT_HEALTH_CHECK_MS,
+        ...connectionOpts,
+      })
+    } catch (error) {
+      record.skipped = String((error as { message?: unknown } | undefined)?.message ?? error)
+      this.log.warn(`${this.label}: mcp ${name} skipped: ${record.skipped}`)
+      return
+    }
+    record.connection = connection
+    // Both services are optional: a composition without them keeps the tools.
+    // The section and the provider read the hub's current record on every call,
+    // so a connection replaced by `restart` is what they serve from then on.
+    ;(c as unknown as {
+      inject?(deps: string[], cb: (inner: { mcpResources: { register(n: string, r: unknown): void } }) => void): void
+    }).inject?.(['mcpResources'], (inner) => {
+      inner.mcpResources.register(name, {
+        request: (request: ResourceRequest, exec: ResourceExec) => {
+          const live = this.servers.get(name)?.connection
+          if (live === undefined) throw new Error(`MCP server "${name}" is not connected`)
+          return live.resources.request(request, exec)
+        },
+      })
+    })
+    ;(c as unknown as {
+      inject?(
+        deps: string[],
+        cb: (inner: {
+          systemPrompt: {
+            section(o: { name: string; order: number; interpolate: boolean; text: () => string }): void
+            getSectionOrder(n: string): number
+          }
+        }) => void,
+      ): void
+    }).inject?.(['systemPrompt'], (inner) => {
+      inner.systemPrompt.section({
+        name: `mcp:${name}`,
+        order: inner.systemPrompt.getSectionOrder('MCP_SERVERS'),
+        interpolate: false,
+        text: () => this.servers.get(name)?.connection?.instructions ?? '',
+      })
+    })
+    await connection.start()
+  }
+
+  /**
+   * Replace ONE server's connection with a fresh one built from `entry`, on the
+   * scope this hub was started on. The rest of the hub is untouched.
+   *
+   * The old connection is disposed first: it unregisters its tools on its own,
+   * and `track` then drops them from `live` and notifies every subagent mirror.
+   * @param entry - the server's current settings entry.
+   * @param resolveEntry - resolves one entry into a client config.
+   * @throws when the hub is not mounted, so there is no scope to mount on.
+   */
+  async restart(entry: McpSpec, resolveEntry: (entry: McpSpec) => Promise<ResolvedServer>): Promise<void> {
+    const c = this.scope
+    const connectionOpts = this.connectionOpts
+    if (c === undefined) throw new Error('MCP hub is not mounted; nothing to restart')
+    const name = entry.serverName
+    const old = this.servers.get(name)
+    if (old?.connection !== undefined) {
+      const previous = old.connection
+      this.servers.delete(name)
+      await previous.dispose()
+    }
+    await this.startServer(c, entry, resolveEntry, connectionOpts)
   }
 
   /** Ping every connected server so the status reflects servers that went away silently. */
@@ -319,6 +368,8 @@ export class McpHub {
 
   async disposeAll(): Promise<void> {
     this.disposed = true
+    // The mounting fiber is going away: `restart` must not put a server on it.
+    this.scope = undefined
     await Promise.allSettled([...this.servers.values()].map((r) => r.connection?.dispose()))
   }
 

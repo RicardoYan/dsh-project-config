@@ -278,7 +278,7 @@ export function mountSubagentTools(
 ): { dispose(): unknown } | undefined {
   if (specs.length === 0) return undefined
   const byName = new Map(specs.map((s) => [s.entry.toolName, s]))
-  return agentCtx.inject(['tools', 'subagents', 'systemPrompt', 'sessionProjections'], (c) => {
+  return agentCtx.inject(['tools', 'subagents', 'systemPrompt', 'sessionProjections'], async (c) => {
     const tools = interceptTools(
       c.tools as unknown as ToolsService,
       (definition, register) => {
@@ -296,6 +296,13 @@ export function mountSubagentTools(
       { log, label },
     )
     const scoped = c.extend({ tools } as never)
+    // `subagentApply` is async: it awaits preset validation before it registers
+    // the tool and its `tool:<name>` prompt section. Awaiting it here keeps the
+    // registrations ahead of `systemPrompt.section(sectionName)` below and lets a
+    // failure be reported against the spec it belongs to; without the await the
+    // section could be written for a roster the tool never joined.
+    // (The callback itself is async, so cordis still waits for it before the
+    // fiber settles — a reload's dispose cannot cut in mid-registration.)
     for (const spec of specs) {
       const { entry } = spec
       if (spec.error !== undefined) continue
@@ -303,7 +310,7 @@ export function mountSubagentTools(
         // No `agentPreset`: the child joins the delegating parent's composition
         // and inherits its tools. The role is applied per child in
         // applyChildRole, not carried by a preset.
-        subagentApply(scoped, {
+        await subagentApply(scoped, {
           provider: entry.provider as never,
           toolName: entry.toolName,
           maxDepth: entry.maxDepth,

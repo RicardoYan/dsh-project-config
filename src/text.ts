@@ -8,19 +8,61 @@ export { L };
 
 export const TEXT = {
   // /project-config
-  commandDescription: L('查看本会话加载的项目配置；reconnect 重连 MCP', 'Show the project settings loaded for this session; reconnect MCP servers'),
-  commandUsage: L('用法：/project-config 查看状态；/project-config reconnect 重连所有未连上的 MCP 服务器；/project-config reconnect <名字> 重连指定的服务器', 'Usage: /project-config shows the status; /project-config reconnect reconnects every MCP server that is not connected; /project-config reconnect <name> reconnects that server'),
-  reconnectNoMcp: L('本会话没有项目 MCP 服务器', 'This session has no project MCP servers'),
-  reconnectUnknown: (name: string, list: string) => L(`没有名为 ${name} 的 MCP 服务器（本会话有：${list || '—'}）`, `No MCP server named ${name} (this session has: ${list || '—'})`),
-  reconnectNothing: L('所有 MCP 服务器都已连接；要强制重连某一个，请写上它的名字', 'Every MCP server is connected; name one to force a reconnect'),
-  reconnectSkipped: (name: string, reason: unknown) => L(
-    T`MCP 服务器 ${name} 在挂载时就被跳过了，重连无法恢复（${reason}）；请修好配置后新开会话`,
-    T`MCP server ${name} was skipped while mounting and cannot be reconnected (${reason}); fix the config, then start a new session`,
+  commandDescription: L('查看本会话加载的项目配置；reload 重挂已加载的内容', 'Show the project settings loaded for this session; reload re-mounts them'),
+  // One command per line: the transcript's GenericCommandCard only offers the
+  // expander when the text contains a newline, and forces a one-line result into
+  // a single `nowrap` row with an ellipsis (dsh-client-ui-chat GenericCommandCard).
+  commandUsage: L(
+    [
+      '用法：',
+      '/project-config 查看状态',
+      '/project-config reload 全部重挂',
+      '/project-config reload subagents|commands|hooks 只重挂一类',
+      '/project-config reload mcp 重连全部 MCP 服务器',
+      '/project-config reload mcp <名字> 只重连指定的服务器',
+    ].join('\n'),
+    [
+      'Usage:',
+      '/project-config shows the status',
+      '/project-config reload re-mounts everything',
+      '/project-config reload subagents|commands|hooks re-mounts one section',
+      '/project-config reload mcp reconnects every MCP server',
+      '/project-config reload mcp <name> reconnects that one server',
+    ].join('\n'),
   ),
-  reconnectAllSkipped: (list: string) => L(
-    T`没有可重连的服务器；以下服务器在挂载时就被跳过了，修好配置后新开会话才会生效：${list}`,
-    T`Nothing to reconnect; these servers were skipped while mounting, so a settings fix takes effect in a new session: ${list}`,
+  // The four words `/project-config reload` accepts. They are the section names
+  // the status report already shows, so they stay untranslated in every message.
+  // Also used for an argument that is not `reload` at all (`… reconnect`).
+  unknownArg: (arg: string) => L(
+    T`不认识的参数 ${arg}`,
+    T`Unknown argument ${arg}`,
   ),
+  reloadUnknownPart: (arg: string) => L(
+    T`不认识的重挂范围 ${arg}\n只能写 subagents、commands、mcp（可再跟一个服务器名）或 hooks`,
+    T`Unknown reload scope ${arg}\nUse subagents, commands, mcp (optionally with one server name) or hooks`,
+  ),
+  // One section per line, for the same reason as `commandUsage`: a one-line
+  // result cannot be expanded in the transcript.
+  reloadDone: (c: { subagents: number; commands: number; mcp: number; hooks: number }) => L(
+    ['reload 完成：', `subagents ${c.subagents}`, `commands ${c.commands}`, `mcp ${c.mcp}`, `hooks ${c.hooks}`].join('\n'),
+    ['reload done:', `subagents ${c.subagents}`, `commands ${c.commands}`, `mcp ${c.mcp}`, `hooks ${c.hooks}`].join('\n'),
+  ),
+  // The failures follow on their own lines; the heading stands alone.
+  // Every one of these ends with a newline so the assembled result stays
+  // multi-line: the transcript offers the expander only for text containing one.
+  reloadPartial: (detail: unknown) => L(T`reload 部分失败：${detail}\n`, T`reload partly failed: ${detail}\n`),
+  // `count` is how many entries follow on the next lines.
+  reloadPartDone: (part: unknown, count: unknown) => L(T`${part} 已重挂（${count} 项）：\n`, T`${part} re-mounted (${count}):\n`),
+  reloadPartFailed: (part: unknown) => L(T`${part} 重挂失败：\n`, T`${part} failed to re-mount:\n`),
+  reloadStale: (list: string) => L(
+    T`另有改动没有重挂：${list}\n要用 /project-config reload 全量重挂才会生效`,
+    T`Also changed but not re-mounted: ${list}\nrun /project-config reload to pick them up`,
+  ),
+  reloadSettingsGone: L(
+    '工作区已经没有 .dsh/settings.yml，本会话不再加载项目配置',
+    'The workspace no longer has .dsh/settings.yml; this session no longer loads project settings',
+  ),
+  reloadMcpUnknown: (name: string, list: string) => L(T`配置里没有名为 ${name} 的 MCP 服务器（现在有：${list || '—'}）`, T`No MCP server named ${name} in the settings (now: ${list || '—'})`),
   noSettings: L('此会话没有加载项目配置（工作区没有 .dsh/settings.yml）', 'No project settings loaded for this session (no .dsh/settings.yml in the workspace)'),
   subagentSession: (name: string) => L(name ? T`子代理会话（沿用主会话的配置）：${name}` : '子代理会话（沿用主会话的配置）', name ? T`Subagent session (uses its root session's settings): ${name}` : "Subagent session (uses its root session's settings)"),
   workspace: (r: string) => L(T`工作区：${r}`, T`Workspace: ${r}`),
@@ -59,8 +101,8 @@ export const TEXT = {
   },
   // A connected server that stopped answering: the tools are still listed.
   mcpUnresponsive: L(
-    '连续 3 次检测没有回应，工具仍在（可以用 /project-config reconnect 重连）',
-    'no reply to 3 health checks; tools kept (use /project-config reconnect to restart it)',
+    '连续 3 次检测没有回应，工具仍在（可以用 /project-config reload mcp 重连）',
+    'no reply to 3 health checks; tools kept (use /project-config reload mcp to restart it)',
   ),
   tools: (n: number) => L(`${n} 个工具`, `${n} ${n === 1 ? 'tool' : 'tools'}`),
   // cause comes from the MCP client (English, already redacted)

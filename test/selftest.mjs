@@ -35,7 +35,7 @@ const { McpHub, resolveServerConfig } = await import('../lib/features/mcp.js');
 const { mountHooks, validateHookMatchers, forwardExitCode } = await import('../lib/features/hooks.js');
 const { normalizeResult, loadHandler } = await import('../lib/features/commands.js');
 const { rewriteRoots, patchSkillRoots, installInstructionsMarker, MARKER } = await import('../lib/isolation.js');
-const { statusText, reconnectText } = await import('../lib/status.js');
+const { statusText, mcpStateText } = await import('../lib/status.js');
 const { createLog } = await import('../lib/log.js');
 const { setLocaleSource, lang } = await import('../lib/locale.js');
 const { TEXT } = await import('../lib/text.js');
@@ -632,26 +632,59 @@ hooks:
   try { await hub.reconnect('c'); } catch (e) { skipErr = e; }
   check('hub: skipped server raises SkippedServer', [skipErr?.name, skipErr?.server, skipErr?.reason], ['SkippedServer', 'c', 'cwd: bad']);
   check('hub: skipped list', hub.skippedServers(), [{ name: 'c', reason: 'cwd: bad' }]);
-  // reconnect output, both languages
+  // per-server state rendering, both languages
   const root = { hub, origin: { mcp: new Map([['b', 'local']]) } };
-  check('reconnect text', [inLang('zh', () => reconnectText(root, ['b'])), inLang('en', () => reconnectText(root, ['b']))],
+  check('mcp state text', [inLang('zh', () => mcpStateText(root, ['b'])), inLang('en', () => mcpStateText(root, ['b']))],
     ['MCP b (local)：✓ 已连接 — 1 个工具', 'MCP b (local): ✓ connected — 1 tool']);
-  // the two new messages, one language at a time, reason included
-  check('reconnect skipped text', [
-    inLang('zh', () => `${TEXT.reconnectSkipped('c', 'cwd: bad')}`),
-    inLang('en', () => `${TEXT.reconnectSkipped('c', 'cwd: bad')}`),
+  // reload messages, one language at a time
+  check('reload unknown part', [
+    inLang('zh', () => `${TEXT.reloadUnknownPart('reconnect')}`),
+    inLang('en', () => `${TEXT.reloadUnknownPart('reconnect')}`),
   ], [
-    'MCP 服务器 c 在挂载时就被跳过了，重连无法恢复（cwd: bad）；请修好配置后新开会话',
-    'MCP server c was skipped while mounting and cannot be reconnected (cwd: bad); fix the config, then start a new session',
+    '不认识的重挂范围 reconnect\n只能写 subagents、commands、mcp（可再跟一个服务器名）或 hooks',
+    'Unknown reload scope reconnect\nUse subagents, commands, mcp (optionally with one server name) or hooks',
   ]);
-  check('reconnect all skipped text', [
-    inLang('zh', () => `${TEXT.reconnectAllSkipped('c (cwd: bad)')}`),
-    inLang('en', () => `${TEXT.reconnectAllSkipped('c (cwd: bad)')}`),
+  // The transcript (dsh-client-ui-chat GenericCommandCard) only offers the
+  // expander when the text contains a newline: a one-line result is forced into
+  // a single nowrap row with an ellipsis and can never be opened. Every message
+  // this command can produce has to stay multi-line.
+  for (const [label, value] of [
+    ['usage', TEXT.commandUsage],
+    ['done', TEXT.reloadDone({ subagents: 9, commands: 0, mcp: 3, hooks: 1 })],
+    ['unknown part', TEXT.reloadUnknownPart('x')],
+    ['part done', TEXT.reloadPartDone('subagents', 3)],
+    ['part failed', TEXT.reloadPartFailed('mcp')],
+    ['stale', TEXT.reloadStale('commands')],
+  ]) {
+    truthy(`reload text is multi-line: ${label}`, String(value).includes('\n'));
+  }
+  check('reload done', [
+    inLang('zh', () => `${TEXT.reloadDone({ subagents: 9, commands: 0, mcp: 3, hooks: 1 })}`),
+    inLang('en', () => `${TEXT.reloadDone({ subagents: 9, commands: 0, mcp: 3, hooks: 1 })}`),
   ], [
-    '没有可重连的服务器；以下服务器在挂载时就被跳过了，修好配置后新开会话才会生效：c (cwd: bad)',
-    'Nothing to reconnect; these servers were skipped while mounting, so a settings fix takes effect in a new session: c (cwd: bad)',
+    'reload 完成：\nsubagents 9\ncommands 0\nmcp 3\nhooks 1',
+    'reload done:\nsubagents 9\ncommands 0\nmcp 3\nhooks 1',
   ]);
-  check('reconnect skipped: en has no chinese', CJK.test(inLang('en', () => `${TEXT.reconnectSkipped('c', 'x')} ${TEXT.reconnectAllSkipped('c')}`)), false);
+  check('reload partial names the section', [
+    inLang('zh', () => `${TEXT.reloadPartial('mcp: 连接超时')}`),
+    inLang('en', () => `${TEXT.reloadPartial('mcp: timeout')}`),
+  ], ['reload 部分失败：mcp: 连接超时\n', 'reload partly failed: mcp: timeout\n']);
+  check('reload one section', [
+    inLang('zh', () => `${TEXT.reloadPartDone('subagents', 2)}`),
+    inLang('en', () => `${TEXT.reloadPartDone('subagents', 2)}`),
+  ], ['subagents 已重挂（2 项）：\n', 'subagents re-mounted (2):\n']);
+  check('reload one section usage: multi-line', [
+    inLang('zh', () => `${TEXT.commandUsage}`).split('\n').length,
+    inLang('en', () => `${TEXT.commandUsage}`).split('\n')[0],
+  ], [6, 'Usage:']);
+  check('reload stale names the section', [
+    inLang('zh', () => `${TEXT.reloadStale('commands')}`),
+    inLang('en', () => `${TEXT.reloadStale('commands')}`),
+  ], [
+    '另有改动没有重挂：commands\n要用 /project-config reload 全量重挂才会生效',
+    'Also changed but not re-mounted: commands\nrun /project-config reload to pick them up',
+  ]);
+  check('reload: en has no chinese', CJK.test(inLang('en', () => `${TEXT.reloadUnknownPart('x')} ${TEXT.reloadSettingsGone} ${TEXT.reloadMcpUnknown('a', 'b')} ${TEXT.mcpUnresponsive}`)), false);
   await hub.disposeAll();
   check('hub: disposeAll stops connections', hub.summary().map((x) => x.status), ['stopped', 'stopped', 'skipped']);
 
@@ -790,9 +823,9 @@ hooks:
   await hub.disposeAll();
 
   check('health: zh text', inLang('zh', () => `${TEXT.mcpState.unresponsive} — ${TEXT.mcpUnresponsive}`),
-    '⚠ 无响应 — 连续 3 次检测没有回应，工具仍在（可以用 /project-config reconnect 重连）');
+    '⚠ 无响应 — 连续 3 次检测没有回应，工具仍在（可以用 /project-config reload mcp 重连）');
   check('health: en text', inLang('en', () => `${TEXT.mcpState.unresponsive} — ${TEXT.mcpUnresponsive}`),
-    '⚠ unresponsive — no reply to 3 health checks; tools kept (use /project-config reconnect to restart it)');
+    '⚠ unresponsive — no reply to 3 health checks; tools kept (use /project-config reload mcp to restart it)');
   check('health: en text has no chinese', CJK.test(inLang('en', () => `${TEXT.mcpState.unresponsive} ${TEXT.mcpUnresponsive}`)), false);
 }
 {
@@ -1276,6 +1309,283 @@ check('result: object', normalizeResult({ a: 1 }).text, '{\n  "a": 1\n}');
   check('life: reload -> no name clash', pluginLog().includes('already registered'), false);
   await fiber.dispose();
   check('life: second unload -> no child left', (await waitFor(() => alive().length === 0)) && alive().length, 0);
+  for (const ag of agents.values()) await ag.ctx.fiber.dispose();
+}
+
+// ---------------------------------------------------------------- /project-config reload (real Cordis, real MCP child, real subagent tools)
+{
+  const { Context, Service } = await import('@deepseek-ai/cordis');
+  const plugin = await import('../lib/index.js');
+  const proj = mk('reload');
+  const pidDir = mk('reload-pids');
+  write(path.join(proj, 'server.mjs'), [
+    "import fs from 'node:fs'; import path from 'node:path';",
+    "fs.writeFileSync(path.join(process.env.PID_DIR, `${process.pid}.pid`), '');",
+    "let buf = ''; const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n');",
+    "process.stdin.on('data', (c) => { buf += c; let i; while ((i = buf.indexOf('\\n')) >= 0) { const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1); if (!l) continue; const m = JSON.parse(l); if (m.id === undefined) continue;",
+    "  if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 't', version: '1' } } });",
+    "  else if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo', inputSchema: { type: 'object' } }] } });",
+    "  else send({ jsonrpc: '2.0', id: m.id, result: {} }); } });",
+    "process.stdin.on('end', () => process.exit(0));",
+  ].join('\n'));
+  write(path.join(proj, 'a.md'), '---\ndescription: role A\n---\nYou are A.');
+  write(path.join(proj, 'b.md'), '---\ndescription: role B\n---\nYou are B.');
+  write(path.join(proj, 'cmd.mjs'), 'export default () => "ok";');
+  const settingsOf = (subagents, commands = '', hooks = '') => [
+    'mcp:',
+    '  - serverName: life',
+    '    transport: stdio',
+    `    command: '${process.execPath.replace(/\\/g, '/')}'`,
+    '    args: [server.mjs]',
+    `    env: { PID_DIR: '${pidDir.replace(/\\/g, '/')}' }`,
+    subagents,
+    commands,
+    hooks,
+  ].filter(Boolean).join('\n');
+  const oneSub = (name, file) => `subagents:\n  - toolName: ${name}\n    personaFile: ${file}\n`;
+  const twoSubs = `${oneSub('alpha', 'a.md')}  - toolName: beta\n    personaFile: b.md\n`;
+  const settingsFile = path.join(proj, '.dsh', 'settings.yml');
+  write(settingsFile, settingsOf(oneSub('alpha', 'a.md')));
+
+  const root = new Context();
+  const agents = new Map();
+  const sessions = new Map();
+  root.provide('agents', { list: () => [...agents.values()], get: (id) => agents.get(id) });
+  root.provide('sessions', { get: (id) => sessions.get(id) });
+  // The plugin registers `/project-config` through `ctx.commands`; this stands in
+  // for dsh-commands so the test can call the handler the UI would call.
+  const registered = new Map();
+  root.provide('commands', {
+    register: (definition) => {
+      registered.set(definition.name, definition);
+      return () => { if (registered.get(definition.name) === definition) registered.delete(definition.name); };
+    },
+  });
+
+  // The real `systemPrompt` and `commands` are cordis services: `this.ctx` inside
+  // them is the *calling* ctx (the tracker proxy rebinds it), so `c.effect(...)`
+  // registers against the caller's fiber and a duplicate name throws. A plain
+  // `provide()` object would be a stricter fake: it would survive the caller's
+  // disposal, which is not what DSH does. These subclasses reproduce the real
+  // lifetime — that is what makes the reload tests meaningful.
+  class FakePrompt extends Service {
+    constructor(ctx) {
+      super(ctx, 'systemPrompt')
+      this.sections = new Set()
+    }
+    section(s) {
+      if (this.sections.has(s.name)) throw new Error(`prompt section "${s.name}" is already registered in this scope`)
+      return this.ctx.effect(() => {
+        this.sections.add(s.name)
+        return () => this.sections.delete(s.name)
+      }, `section ${s.name}`)
+    }
+    context() {
+      return () => {}
+    }
+    getSectionOrder() {
+      return 2800
+    }
+    getContextOrder() {
+      return 0
+    }
+  }
+  class FakeCommands extends Service {
+    constructor(ctx) {
+      super(ctx, 'commands')
+      this.entries = new Map()
+    }
+    register(definition) {
+      if (this.entries.has(definition.name)) throw new Error(`command "${definition.name}" is already registered in this scope`)
+      return this.ctx.effect(() => {
+        this.entries.set(definition.name, definition)
+        return () => { if (this.entries.get(definition.name) === definition) this.entries.delete(definition.name) }
+      }, `command ${definition.name}`)
+    }
+  }
+
+  // An agent scope that satisfies what mountSubagentTools injects: tools,
+  // subagents, systemPrompt, sessionProjections. The `subagents` provider is the
+  // minimum dsh-tool-subagent's apply() needs (presets unconfigured, provider present).
+  const makeAgent = (id, header = {}) => {
+    const tools = new Map();
+    const fiber = root
+      .isolate('tools')
+      .isolate('systemPrompt')
+      .isolate('subagents')
+      .isolate('sessionProjections')
+      .isolate('commands')
+      .plugin({
+        name: `agent-${id}`,
+        apply: (c) => {
+          c.provide('tools', {
+            register: (d) => {
+              if (tools.has(d.name)) throw new Error(`tool "${d.name}" is already registered in this scope`);
+              tools.set(d.name, d);
+              return () => { if (tools.get(d.name) === d) tools.delete(d.name); };
+            },
+            get: (name) => tools.get(name),
+          });
+          new FakePrompt(c);
+          new FakeCommands(c);
+          c.provide('subagents', {
+            getProvider: () => ({ name: 'fake', capabilities: { agentOptions: true, depthLimit: true }, inheritsParentContext: false }),
+            resolveMaxDepth: () => undefined,
+          });
+          c.provide('sessionProjections', { register: () => () => {} });
+        },
+      });
+    const session = { id, header: { id, cwd: proj, ...header }, snapshotEvents: () => [] };
+    const agent = { id, session, ctx: fiber.ctx, tools, commands: () => fiber.ctx.get('commands')?.entries ?? new Map() };
+    agents.set(id, agent); sessions.set(id, session);
+    return agent;
+  };
+  const alive = () => fs.readdirSync(pidDir).map((f) => Number.parseInt(f, 10)).filter((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  const waitFor = async (fn, ms = 10000) => { const end = Date.now() + ms; while (Date.now() < end) { if (fn()) return true; await new Promise((r) => setTimeout(r, 50)); } return fn(); };
+  const pluginLog = () => { try { return fs.readFileSync(path.join(testTemp, 'dsh-project-config.log'), 'utf8'); } catch { return ''; } };
+
+  const a = makeAgent('reload-a');
+  let fiber = root.plugin(plugin, {});
+  await fiber;
+  const run = async (input, agent = a) => {
+    const definition = registered.get('project-config');
+    if (definition === undefined) throw new Error('/project-config was not registered');
+    return definition.handler({ agent, rawInput: input });
+  };
+
+  truthy('reload: initial subagent mounted', await waitFor(() => a.tools.has('alpha')));
+  truthy('reload: initial mcp connected', await waitFor(() => a.tools.has('mcp__life__echo')));
+  check('reload: one mcp child', alive().length, 1);
+  const firstPid = alive()[0];
+
+  // --- full reload: settings change is picked up, nothing crashes --------------
+  write(settingsFile, settingsOf(twoSubs, 'commands:\n  - name: hi\n    description: d\n    handlerFile: cmd.mjs\n', 'hooks:\n  tools/pre-execute:\n    - { command: node x.mjs }\n'));
+  let out = await run('reload');
+  check('reload: full -> success', out.kind, 'success');
+  truthy('reload: full reports the new subagent', out.text.includes('subagents 2'));
+  truthy('reload: full mounted the new subagent', await waitFor(() => a.tools.has('beta')));
+  truthy('reload: full reconnected mcp', await waitFor(() => a.tools.has('mcp__life__echo')));
+  truthy('reload: full mounted the command', await waitFor(() => a.commands().has('hi')));
+  check('reload: old mcp child replaced', (await waitFor(() => alive().length === 1)) && alive()[0] !== firstPid, true);
+
+  // twice in a row: releaseRoot has to be complete or the second mount throws
+  const beforeLog = pluginLog().length;
+  out = await run('reload');
+  check('reload: second full reload succeeds', out.kind, 'success');
+  check('reload: no duplicate registration', pluginLog().slice(beforeLog).includes('already registered'), false);
+  truthy('reload: subagents still mounted after two reloads', a.tools.has('alpha') && a.tools.has('beta'));
+
+  // --- single sections --------------------------------------------------------
+  // subagents only: a removed entry disappears, other sections stay
+  write(settingsFile, settingsOf(oneSub('alpha', 'a.md'), 'commands:\n  - name: hi\n    description: d\n    handlerFile: cmd.mjs\n', 'hooks:\n  tools/pre-execute:\n    - { command: node x.mjs }\n'));
+  truthy('reload subagents: mcp back before the run', await waitFor(() => a.tools.has('mcp__life__echo')));
+  out = await run('reload subagents');
+  check('reload subagents: success', out.kind, 'success');
+  truthy('reload subagents: names the tools', out.text.includes('alpha') && !out.text.includes('beta'));
+  check('reload subagents: removed tool gone', a.tools.has('beta'), false);
+  truthy('reload subagents: kept tool still there', a.tools.has('alpha'));
+  truthy('reload subagents: mcp untouched', a.tools.has('mcp__life__echo'));
+  truthy('reload subagents: command untouched', a.commands().has('hi'));
+
+  // commands only: the handler is registered again under the same name
+  write(settingsFile, settingsOf(oneSub('alpha', 'a.md'), 'commands:\n  - name: hi\n    description: d\n    handlerFile: cmd.mjs\n  - name: bye\n    description: d\n    handlerFile: cmd.mjs\n', 'hooks:\n  tools/pre-execute:\n    - { command: node x.mjs }\n'));
+  out = await run('reload commands');
+  check('reload commands: success', out.kind, 'success');
+  truthy('reload commands: reports both', out.text.includes('/hi') && out.text.includes('/bye'));
+  truthy('reload commands: new command registered', await waitFor(() => a.commands().has('bye')));
+  truthy('reload commands: subagent untouched', a.tools.has('alpha'));
+
+  // hooks only: kept as one section, and the status counts it
+  out = await run('reload hooks');
+  check('reload hooks: success', out.kind, 'success');
+  truthy('reload hooks: names the event', out.text.includes('tools/pre-execute'));
+
+  // mcp only: the child process is replaced, the rest is untouched
+  const pidBeforeMcp = alive()[0];
+  out = await run('reload mcp');
+  check('reload mcp: success', out.kind, 'success');
+  truthy('reload mcp: reports the server', out.text.includes('life'));
+  truthy('reload mcp: reconnected', await waitFor(() => a.tools.has('mcp__life__echo')));
+  check('reload mcp: child replaced', (await waitFor(() => alive().length === 1)) && alive()[0] !== pidBeforeMcp, true);
+  truthy('reload mcp: subagent untouched', a.tools.has('alpha'));
+  truthy('reload mcp: command untouched', a.commands().has('bye'));
+
+  // one named server
+  const pidBeforeNamed = alive()[0];
+  out = await run('reload mcp life');
+  check('reload mcp <name>: success', out.kind, 'success');
+  truthy('reload mcp <name>: reconnected', await waitFor(() => a.tools.has('mcp__life__echo')));
+  check('reload mcp <name>: child replaced', (await waitFor(() => alive().length === 1)) && alive()[0] !== pidBeforeNamed, true);
+
+  // --- mcp added after the session was mounted -------------------------------
+  // The mount happened while settings.yml had no `mcp` section, so there is no
+  // hub; naming a server must bring the whole section up rather than report that
+  // nothing is mounted.
+  {
+    const lateDir = mk('reload-late');
+    const latePid = mk('reload-late-pids');
+    write(path.join(lateDir, 'server.mjs'), fs.readFileSync(path.join(proj, 'server.mjs')));
+    const lateSettings = path.join(lateDir, '.dsh', 'settings.yml');
+    write(lateSettings, 'subagents: []\n');
+    const late = makeAgent('reload-late', { cwd: lateDir });
+    await root.serial('agent/created', { agent: late, source: 'startup' });
+    await waitFor(() => agents.has('reload-late'));
+    const lateRun = async (input) => {
+      const definition = registered.get('project-config');
+      return definition.handler({ agent: late, rawInput: input });
+    };
+    check('reload late mcp: no hub yet', late.tools.size > 0 ? late.tools.has('mcp__life__echo') : false, false);
+    write(lateSettings, `mcp:\n  - serverName: life\n    transport: stdio\n    command: '${process.execPath.replace(/\\/g, '/')}'\n    args: [server.mjs]\n    env: { PID_DIR: '${latePid.replace(/\\/g, '/')}' }\n`);
+    const r = await lateRun('reload mcp life');
+    check('reload late mcp: succeeds', r.kind, 'success');
+    truthy('reload late mcp: server is up', await waitFor(() => late.tools.has('mcp__life__echo')));
+  }
+
+  out = await run('reload mcp nope');
+  check('reload mcp unknown: error', out.kind, 'error');
+  truthy('reload mcp unknown: names it and lists the rest', out.text.includes('nope') && out.text.includes('life'));
+
+  // --- argument validation ----------------------------------------------------
+  for (const [input, needle] of [
+    ['reconnect', '不认识的参数 reconnect'],
+    ['reload reconnect', '不认识的重挂范围 reconnect'],
+    ['reload mcp a b', '用法'],
+    ['reload x', '不认识的重挂范围 x'],
+    ['reload mcp a b c', '用法'],
+  ]) {
+    const r = await run(input);
+    check(`reload args: ${input} -> error`, r.kind, 'error');
+    truthy(`reload args: ${input} -> names the problem (${needle})`, r.text.includes(needle));
+    truthy(`reload args: ${input} -> multi-line`, r.text.includes('\n'));
+  }
+
+  // --- a running subagent session survives a full reload ----------------------
+  const child = makeAgent('reload-child', { origin: 'subagent', parentSession: 'reload-a', delegationDepth: 1 });
+  await root.serial('agent/created', { agent: child, source: 'subagent' });
+  truthy('reload child: mirror mounted', await waitFor(() => child.tools.has('mcp__life__echo')));
+  // maxDepth defaults to 1, so a depth-1 child gets no project subagents of its
+  // own: only the mirror and hooks are on its scope.
+  const childToolsBefore = [...child.tools.keys()].sort();
+  out = await run('reload');
+  check('reload child: full reload succeeds', out.kind, 'success');
+  truthy('reload child: still has the mcp tool', await waitFor(() => child.tools.has('mcp__life__echo')));
+  check('reload child: tool set restored', [...child.tools.keys()].sort(), childToolsBefore);
+
+  // --- broken settings: reported, the running mount is left alone -------------
+  write(settingsFile, 'not: [valid: yaml\n');
+  out = await run('reload subagents');
+  check('reload: broken yaml -> error', out.kind, 'error');
+  truthy('reload: broken yaml -> says why', out.text.includes('YAML') || out.text.includes('yaml') || out.text.includes('settings'));
+  truthy('reload: broken yaml -> old subagents still mounted', a.tools.has('alpha'));
+
+  // --- no settings any more ---------------------------------------------------
+  fs.rmSync(settingsFile);
+  out = await run('reload');
+  check('reload: settings gone -> reported', out.kind, 'success');
+  truthy('reload: settings gone -> says so', out.text.includes('settings.yml'));
+
+  await fiber.dispose();
+  check('reload: unload -> no child left', (await waitFor(() => alive().length === 0)) && alive().length, 0);
   for (const ag of agents.values()) await ag.ctx.fiber.dispose();
 }
 

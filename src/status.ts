@@ -149,8 +149,8 @@ export function statusText(mount: StatusMount | undefined, { logFile }: StatusDe
   return lines.join('\n')
 }
 
-/** Result of `/project-config reconnect`: one line per server reconnected. */
-export function reconnectText(root: StatusRoot, names: readonly string[]): string {
+/** `/project-config reload mcp`: one line per server, in its current state. */
+export function mcpStateText(root: StatusRoot, names: readonly string[]): string {
   const byName = new Map((root.hub?.summary() ?? []).map((x) => [x.name, x]))
   return names
     .map((n) => {

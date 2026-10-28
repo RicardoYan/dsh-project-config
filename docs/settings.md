@@ -3,13 +3,13 @@
 本文是 dsh-project-config 的完整配置参考。快速上手看 [README](../README.md)；写配置、排查问题看这里。
 
 **读者是项目维护者。** 插件只提供机制（读配置、挂载、运行），**不替项目写配置**。
-从别的工具迁过来要自己换算，§8 有对照表和例子。
+从别的工具迁过来要自己换算，§9 有对照表和例子。
 
 ## 1. 先看这几条（最常踩的坑）
 
-1. **文件名只认 `.dsh/settings.yml`**，外加个人用的 `.dsh/settings.local.yml`（见 §7）。其他文件名（如 `project-config.yml`）不读取，也不提示
+1. **文件名只认 `.dsh/settings.yml`**，外加个人用的 `.dsh/settings.local.yml`（见 §8）。其他文件名（如 `project-config.yml`）不读取，也不提示
 2. **凭据写在 `settings.local.yml`，并把它加进 `.gitignore`**。`settings.yml` 会提交到 git，不要写 token
-3. **改完配置要新开会话**才生效；当前会话发 `/project-config` 看读到了什么、哪些被跳过、为什么
+3. **改完配置**：新开会话生效；当前会话想立刻生效用 `/project-config reload`（不带参数全量，或只重挂某一类），它会重读配置文件。改了 mcp 的 url/token 之类，用 `reload mcp` 就够。当前会话发 `/project-config` 还能看读到了什么、哪些被跳过、为什么
 4. **写错的字段不会报错**，只在 `/project-config` 里给一条 `⚠`。改完配置先看一眼
 5. **工具名用 DSH 的名字**：`read`、`write`、`edit`、`grep`、`glob`、`pwsh`（Windows）/ `bash`（macOS、Linux），不是 `Read`、`Bash`。DSH 里不存在这个名字时，`toolFilter` 那条限制会被跳过（`/project-config` 不报，见诊断日志），hooks 的 `matcher` 同理
 6. **命令、MCP、hooks 只要配置了就会运行**，不额外询问；只在该工作区的会话里生效
@@ -206,7 +206,7 @@ mcp:
 | `command` / `args` / `env` / `cwd` | 仅 stdio。直接启动程序，不经过 shell；`args` 里的相对路径相对 `cwd` |
 | `url` / `headers` | 仅 streamable-http |
 | `toolCallTimeoutMs` | 每次调用超时，默认 60000 |
-| `failOnStartupError` | 默认 `false`；`true` 时第一次连不上就不再重试（状态「连接失败」），可以用 `/project-config reconnect` 手动重连 |
+| `failOnStartupError` | 默认 `false`；`true` 时第一次连不上就不再重试（状态「连接失败」），可以用 `/project-config reload mcp <名字>` 手动重连 |
 | `maxInstructionBytes` | 服务器说明文字上限，默认 32768 |
 | `reconnect` | 自动重连：`enabled`（默认 true）、`initialDelayMs`（默认 500）、`maxDelayMs`（默认 30000）、`maxAttempts`（默认 10）。间隔从 `initialDelayMs` 起每次翻倍，最长 `maxDelayMs`；连续失败 `maxAttempts` 次后放弃，工具移除。连上后稳定超过 `maxDelayMs`，次数重新计算 |
 
@@ -214,7 +214,7 @@ mcp:
 
 **不要把 token 明文写进 `settings.yml`**，它会被提交到 git。两种方式任选：
 
-1. **明文写在 `settings.local.yml`**（推荐个人使用）：在 `settings.local.yml` 里写一条同名的完整条目，覆盖 `settings.yml` 里的那条（见 §7）。别忘了把它加进 `.gitignore`
+1. **明文写在 `settings.local.yml`**（推荐个人使用）：在 `settings.local.yml` 里写一条同名的完整条目，覆盖 `settings.yml` 里的那条（见 §8）。别忘了把它加进 `.gitignore`
 
    ```yaml
    # .dsh/settings.yml（提交）
@@ -246,7 +246,7 @@ mcp:
 | 状态 | 含义 |
 |---|---|
 | `✓ 已连接 — N 个工具` | 正常 |
-| `⚠ 无响应 — 连续 3 次检测没有回应，工具仍在（可以用 /project-config reconnect 重连）` | 连接还在，但服务器连续 3 次没回应健康检查（每 30 秒一次，每次等 5 秒）；工具照旧列着，调用可能超时 |
+| `⚠ 无响应 — 连续 3 次检测没有回应，工具仍在（可以用 /project-config reload mcp 重连）` | 连接还在，但服务器连续 3 次没回应健康检查（每 30 秒一次，每次等 5 秒）；工具照旧列着，调用可能超时 |
 | `✗ 连接失败，重试中 — 原因（第 i/n 次重试）` | 还没连上过，正在自动重试 |
 | `⟳ 连接断开，重连中 — 原因（第 i/n 次重试）` | 连上过，后来断了；重连期间工具还在，调用会报错 |
 | `✗ 连接失败 — 原因` | 已放弃自动重试，工具已移除 |
@@ -289,18 +289,19 @@ v0.3.0 及以前，只有你手动执行 `/project-config` 时才会 ping 一次
 
 **手动重连**（不用重启 DSH，也不用新开会话）：
 
-- `/project-config reconnect`：重连所有没连上的服务器，**以及所有「无响应」的**（它们连上了但不回话，重启是唯一能试的）
-- `/project-config reconnect <名字>`：重连这一个，已连上的也会断开重连（比如服务器重启过、换了 token）
-- 立即重连，重试次数清零；命令等这次连接有结果后返回状态
+- `/project-config reload mcp`：重读 `mcp` 配置，**所有**项目服务器删掉旧连接、按新配置重连；同时刷新子会话里的 MCP 工具
+- `/project-config reload mcp <名字>`：只重建这一个服务器的连接，其余服务器不受影响（也从新配置读，所以换 token、改 url 对它同样生效）
+- 重试次数清零；命令等这次连接有结果后返回状态
 - 第一次调用模型前只等第一次连接；之后才连上的服务器，工具在下一次调用模型时出现
-- **状态是「跳过」的服务器重连不了**：它们根本没建连接（缺环境变量、`cwd` 不合法、`reconnect` 写错），`reconnect` 会直接说明是哪个、为什么，而不是回一句「都已连接」。修好配置后新开会话才生效
-- 重连会先关掉旧连接，**正在跑的工具调用会被中断**；手动重连「无响应」的服务器时要想到这一点
+- **状态是「跳过」的服务器重连不了**（`reload mcp <名字>` 也救不回来，它根本没有连接对象）：要改配置后再 reload。`/project-config reload mcp`（不带名字）会重读配置并重新解析每个服务器，所以 `cwd`、`reconnect` 写错这类问题改完 reload 就能恢复；缺环境变量则要重启 DSH 让它进来
+- 重连会先关掉旧连接，**正在跑的工具调用会被中断**；重连「无响应」的服务器时要想到这一点
+- **`reload mcp` 带名字时清不掉删掉的服务器**：从配置里删掉一个服务器后，它的工具和状态行会消失，但它注册的 prompt 段落（服务器说明）要 `reload`（不带参数）才会彻底移除。删服务器后建议直接 `/project-config reload`
 
 **连接什么时候断开**
 
 - 每个打开过的主会话各有一份连接（stdio 就是各一个子进程）。DSH 打开过的会话会一直留在内存里直到 DSH 退出，关掉窗口或归档都不会释放，所以它的连接也一直在
 - 会话被删除（如用 dsh-session-purger）、本插件被卸载或重新加载时，连接立即断开，stdio 子进程随之退出
-- 工具名和已注册的工具重名时（比如别的插件或 DSH 配置里有同名服务器），直接判为「连接失败」，不再自动重试；去掉冲突后用 `/project-config reconnect <名字>`
+- 工具名和已注册的工具重名时（比如别的插件或 DSH 配置里有同名服务器），直接判为「连接失败」，不再自动重试；去掉冲突后用 `/project-config reload mcp <名字>`
 
 
 ## 6. `hooks`
@@ -388,8 +389,61 @@ process.stdin.on('data', (d) => (s += d)).on('end', () => {
 - Windows 上带引号的程序路径前要加 `&`：`& "C:/Program Files/nodejs/node.exe" .dsh/hooks/guard.mjs`
 - hook 受当前会话的沙箱限制：会话是只读模式时，hook 也写不了文件
 
-## 7. `settings.local.yml`：个人配置
+## 7. `/project-config reload`：当前会话立刻生效
 
+改了配置不用新开会话。`reload` 会**重读** `settings.yml` 和 `settings.local.yml`，把读到的内容重新挂到当前会话上：
+
+| 命令 | 重挂什么 | 说明 |
+|---|---|---|
+| `/project-config reload` | 全部四类 | 读配置 → 释放整个会话挂载 → 重挂。MCP 全部重连 |
+| `/project-config reload subagents` | 子代理工具 | 加/删/改 `subagents` 条目、改 `agentOptions`、改 persona 文件内容 |
+| `/project-config reload commands` | 斜杠命令 | 命令的 `handlerFile` 本来每次执行都会重新 import，这条主要管增删命令 |
+| `/project-config reload mcp` | 全部 MCP 服务器 | 断开重连，重读 url/token/env 等 |
+| `/project-config reload mcp <名字>` | 一个 MCP 服务器 | 其余服务器不受影响，也从新配置读 |
+| `/project-config reload hooks` | hooks | 事件、matcher、command 都重挂 |
+
+**只挂一类时，别的类改了配置不会跟着生效**。命令返回里会提示 `另有改动没有重挂: commands` 这类信息，要哪类生效就 reload 哪类，或者不带参数全量。
+
+返回示例：
+
+```
+reload 完成：
+subagents 9
+commands 0
+mcp 3
+hooks 1
+```
+
+单项（列出这一类现在挂着什么，一行一条）：
+
+```
+subagents 已重挂（9 项）：
+code-reviewer
+doc-writer
+…
+MCP life：✓ 已连接 — 1 个工具
+```
+
+失败会逐条列出来，不会静默：
+
+```
+reload 部分失败：
+mcp: 连接超时
+```
+
+**为什么要一行一条**：DSH 的对话界面（`dsh-client-ui-chat` 的 `GenericCommandCard`）只在文本**含换行**时才给「展开」；单行结果会被强行压成一行加省略号，永远展不开。所以本命令的所有输出都保持多行。
+
+
+### 限制与风险
+
+1. **无参数 reload 会让全部 MCP 服务器重连，正在进行中的 MCP 调用被中断**（调用方拿到 `Connection closed`）。长任务期间别执行
+2. **hooks 计数归零**：`/project-config` 里「已运行 N 次 / 失败 N 次」统计的是当前挂着的 hooks，重挂后从头算
+3. **正在跑的子代理会被迁移**：它们的 MCP 工具镜像和 hooks 换成新配置（reload 不会让它们丢工具）；但它们已经能派生的嵌套子代理清单（`toolFilter` + `maxDepth` 决定的那些）保持 reload 前的样子，新派生的才用新配置
+4. **带名字的 `reload mcp` 清不掉已删除的服务器**：从配置里删掉一个服务器后，它的工具和状态行会消失，但它注册的 prompt 段落（服务器说明）要全量 `reload` 才彻底移除。删服务器后建议直接 `/project-config reload`
+5. **子代理工具重挂后旧引用失效**：若某次调用正持有 reload 前的工具句柄，拿到的是过期定义
+6. **`reload subagents` 不重读子代理会话**：已经在跑的嵌套子代理会话继续用它自己的挂载
+
+## 8. `settings.local.yml`：个人配置
 和 `settings.yml` 放在同一个目录（`.dsh/`），放只属于你自己的配置：MCP 凭据、个人的 hooks、自己才用的子代理。**要把它加进 `.gitignore`**（插件不检查它有没有被 git 跟踪）：
 
 ```gitignore
@@ -438,7 +492,7 @@ mcp:
 - 被 `enabled: false` 去掉的列在「已移除」一行
 - 告警前面写明来自哪个文件：`settings.local.yml：mcp[0] (docs)：……`
 
-## 8. 从 Claude Code 迁移
+## 9. 从 Claude Code 迁移
 
 本插件只读 `.dsh/settings.yml`，不读 `.claude/` 下的任何配置，需要手动搬：
 
@@ -448,8 +502,8 @@ mcp:
 | `.claude/commands/*.md`（提示词模板） | 不支持。这里的命令运行 JS，结果不发给模型；提示词模板可以改成 skill |
 | `.claude/settings.json` 的 `hooks` | `hooks`，事件名按 §6 换；matcher 里的 `Bash` 换成 `pwsh` / `bash`，`Read` 换成 `read` 等 |
 | `.mcp.json` 的 `mcpServers` | `mcp` 列表：键名变成 `serverName`，`type` 变成 `transport`（`http` → `streamable-http`）。不含凭据、要提交的放 `settings.yml` |
-| 被 gitignore、含 token 的 `.mcp.json` | `settings.local.yml` 的 `mcp`（凭据可以明文写，见 §7） |
-| `.claude/settings.local.json` | `settings.local.yml`（同样的合并思路，规则见 §7） |
+| 被 gitignore、含 token 的 `.mcp.json` | `settings.local.yml` 的 `mcp`（凭据可以明文写，见 §8） |
+| `.claude/settings.local.json` | `settings.local.yml`（同样的合并思路，规则见 §8） |
 | `CLAUDE.md` | 原样可用（DSH 读 `AGENTS.md` 和 `CLAUDE.md`） |
 
 ### 工具名对照（`tools` / `disallowedTools` → `toolFilter`）
@@ -508,7 +562,7 @@ persona 文件的 frontmatter 只用来提供 `description`（省略配置里的
 | `mcpServers` | 不生效。服务器写在 `settings.yml` 的 `mcp` 里，对该工作区所有子代理生效 |
 | `hooks` | 不生效。hooks 写在 `settings.yml` 的 `hooks` 里，是工作区级的 |
 
-## 9. 排查
+## 10. 排查
 
 | 现象 | 看哪里 |
 |---|---|
@@ -524,10 +578,10 @@ persona 文件的 frontmatter 只用来提供 `description`（省略配置里的
 | 子代理启动时报 `has no configured model` | `agentOptions` 里的 `provider`/`model` 组合不存在。确认那个 provider 下确实有这个模型 |
 | 配了 `agentOptions` 但看起来没生效 | `/project-config` 只能证明配置读进去了。要确认得跑一次子代理，解压它的会话日志看 `request/header` 里的 `data.header.config.reasoningEffort`（§3「agentOptions」） |
 | 警告里出现「未知字段 backgroundMode」 | v0.4.0 起该字段已删除（DSH 不再支持前台/后台切换）。从配置里删掉这一行即可，条目本来就在正常加载 |
-| MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错。**改完要新开会话**，`reconnect` 对它无效 |
-| MCP「连接失败」「重试中」 | 看后面的原因；stdio 先在终端里用同样的 `command` / `args` 跑一下。修好后 `/project-config reconnect <名字>` |
+| MCP「跳过」 | 缺环境变量、`cwd` 不合法，或 `reconnect` 写错。`reload mcp <名字>` 对它无效（没有连接对象）；`/project-config reload mcp`（不带名字）会重读配置并重新解析，改对 `cwd` / `reconnect` 后能用它恢复；缺环境变量要重启 DSH |
+| MCP「连接失败」「重试中」 | 看后面的原因；stdio 先在终端里用同样的 `command` / `args` 跑一下。修好后 `/project-config reload mcp <名字>` |
 | MCP「连接失败 — tool registration failed: … already registered」 | 有同名工具：换一个 `serverName`，或去掉另一边的同名服务器 |
-| MCP「无响应」 | 服务器连续 3 次没回 ping。先确认它是不是在跑长任务（同步阻塞的实现会这样，跑完就恢复）；确实卡死了就 `/project-config reconnect <名字>`。**注意重连会中断正在跑的调用** |
+| MCP「无响应」 | 服务器连续 3 次没回 ping。先确认它是不是在跑长任务（同步阻塞的实现会这样，跑完就恢复）；确实卡死了就 `/project-config reload mcp <名字>`。**注意重连会中断正在跑的调用** |
 | stdio 子进程很多 | 每个打开过的主会话一个，直到 DSH 退出或会话被删除（§5「连接什么时候断开」） |
 | hook 不触发 | 事件名、matcher 写法；标「—」的事件不能写 matcher |
 | hook 应拦截却没拦 | 退出码必须正好是 2；或 JSON 写在 stdout 且退出码为 0 |
