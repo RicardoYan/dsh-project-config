@@ -551,6 +551,22 @@ hooks:
   try { await registered.get('mcp__k__echo').execute({}, { signal: new AbortController().signal }); } catch { /* expected */ }
   check('conn: protocol error keeps connected', view()[0], 'connected');
   fake.callError = undefined;
+  // 7b. resources: a server without the capability answers the two list methods
+  // with an empty page (the official provider's rule since DSH 0.2.1-rc.5)
+  const resReq = () => ({ signal: new AbortController().signal });
+  check('conn: resources/list without capability -> empty page', await conn.resources.request({ method: 'resources/list' }, resReq()), { resources: [] });
+  check('conn: templates/list without capability -> empty page', await conn.resources.request({ method: 'resources/templates/list' }, resReq()), { resourceTemplates: [] });
+  // the capability check must short-circuit before the SDK client is touched
+  let listCalls = 0;
+  fake.current.listResources = async () => { listCalls += 1; return { resources: [{ uri: 'x://1', name: 'one' }] } };
+  fake.current.listResourceTemplates = async () => { listCalls += 1; return { resourceTemplates: [] } };
+  await conn.resources.request({ method: 'resources/list' }, resReq());
+  check('conn: capability-less list never reaches the client', listCalls, 0);
+  // a server that DOES declare resources calls through
+  fake.current.getServerCapabilities = () => ({ tools: {}, resources: {} });
+  check('conn: declared resources -> client answer', await conn.resources.request({ method: 'resources/list' }, resReq()), { resources: [{ uri: 'x://1', name: 'one' }] });
+  check('conn: declared resources reaches the client', listCalls, 1);
+  fake.current.getServerCapabilities = () => ({ tools: {} });
   // 8. ping check: dead server found without a call
   fake.pingError = Object.assign(new Error('Connection closed'), { code: 'CONNECTION_CLOSED' });
   fake.connectError = () => new Error('down');

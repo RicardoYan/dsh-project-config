@@ -141,7 +141,7 @@ interface ClientLike {
   connect(transport: unknown): Promise<void>
   close(): Promise<void>
   getInstructions?(): string | undefined
-  getServerCapabilities(): { tools?: unknown } | undefined
+  getServerCapabilities(): { tools?: unknown; resources?: unknown } | undefined
   listTools(
     params: unknown,
     options: { cacheMode: string },
@@ -752,13 +752,19 @@ export class McpConnection {
         }
         const client = gen.client as ClientLike
         const options = { signal: exec.signal, timeout: this.timeoutMs }
+        // Same rule as the official provider since DSH 0.2.1-rc.5: a server that
+        // never declared resources answers the two list methods with an empty
+        // page instead of the SDK's capability error.
+        const listable = client.getServerCapabilities()?.resources !== undefined
         switch (request.method) {
           case 'resources/list':
+            if (!listable) return { resources: [] }
             return client.listResources(
               request.cursor === undefined ? undefined : { cursor: request.cursor },
               options,
             )
           case 'resources/templates/list':
+            if (!listable) return { resourceTemplates: [] }
             return client.listResourceTemplates(
               request.cursor === undefined ? undefined : { cursor: request.cursor },
               options,
