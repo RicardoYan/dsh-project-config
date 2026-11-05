@@ -8,7 +8,8 @@
 // - @deepseek-ai/dsh-agent-instructions: config field `projectRootMarkers`
 //   (child names, first match wins while walking up).
 // - cordis: global `internal/config` waterfall runs when a fiber resolves its config;
-//   `fiber.restart()` re-resolves it.
+//   `fiber.restart()` re-resolves it. Cordis 4.1 (DSH 0.2.2) passes the fiber as
+//   the first payload argument instead of binding it as `this`; both are handled.
 import fs from 'node:fs'
 import path from 'node:path'
 import type { Context, Fiber } from '@deepseek-ai/cordis'
@@ -132,9 +133,27 @@ export function installInstructionsMarker(ctx: Context, log: IsolationLog): void
   let active = true
   ctx.on(
     'internal/config',
-    function (this: Fiber, config: unknown, next: () => unknown) {
+    function (this: Fiber, first: unknown, second?: unknown) {
+      // Cordis 4.0 (DSH <=0.2.1): payload `(rawConfig, next)`, the fiber is `this`.
+      // Cordis 4.1 (DSH >=0.2.2): payload `(fiber, next)`, `this` is not the fiber.
+      // A fiber carries `ctx` and `uid`; a raw config object carries neither.
+      const fiberAsArgument =
+        first !== null &&
+        typeof first === 'object' &&
+        typeof (first as { ctx?: unknown }).ctx === 'object' &&
+        (first as { ctx?: unknown }).ctx !== null &&
+        'uid' in (first as object)
+      const fiber = fiberAsArgument ? (first as Fiber) : (this as Fiber)
+      // `next` is the SECOND argument in both shapes; fall back to the first only
+      // so an unexpected arity cannot turn the hook into a silent passthrough.
+      const next = (typeof second === 'function'
+        ? second
+        : typeof first === 'function'
+          ? first
+          : undefined) as (() => unknown) | undefined
+      if (typeof next !== 'function') return first
       const out = next()
-      if (!active || this?.runtime?.callback !== instructionsApply || out === null || typeof out !== 'object') {
+      if (!active || fiber?.runtime?.callback !== instructionsApply || out === null || typeof out !== 'object') {
         return out
       }
       const target = out as InstructionsConfig

@@ -1203,13 +1203,22 @@ check('result: object', normalizeResult({ a: 1 }).text, '{\n  "a": 1\n}');
     registry: { get: () => undefined },
   };
   installInstructionsMarker(fakeCtx, quietLog);
-  const run = (callback, cfg) => hook.call({ runtime: { callback } }, cfg, () => cfg);
-  check('marker: inserted for agent-instructions', run(instructionsApply, { maxBytes: 1, projectRootMarkers: ['.git'] }).projectRootMarkers, [MARKER, '.git']);
-  check('marker: default markers', run(instructionsApply, { maxBytes: 1 }).projectRootMarkers, [MARKER, '.git']);
-  check('marker: idempotent', run(instructionsApply, { projectRootMarkers: [MARKER, '.git'] }).projectRootMarkers, [MARKER, '.git']);
-  check('marker: other plugins untouched', run(() => {}, { projectRootMarkers: ['.git'] }).projectRootMarkers, ['.git']);
+  // Two payload shapes must both work: cordis 4.0 `(rawConfig, next)` with the
+  // fiber as `this`, and cordis 4.1 `(fiber, next)` with no `this`. The fiber
+  // in the 4.1 shape carries `ctx` and `uid`, which a raw config never does.
+  const fiberFor = (callback) => ({ runtime: { callback }, ctx: {}, uid: 1 });
+  const runLegacy = (callback, cfg) => hook.call(fiberFor(callback), cfg, () => cfg);
+  const runModern = (callback, cfg) => hook.call(undefined, fiberFor(callback), () => cfg);
+  for (const [label, run] of [['4.0', runLegacy], ['4.1', runModern]]) {
+    check(`marker(${label}): inserted for agent-instructions`, run(instructionsApply, { maxBytes: 1, projectRootMarkers: ['.git'] }).projectRootMarkers, [MARKER, '.git']);
+    check(`marker(${label}): default markers`, run(instructionsApply, { maxBytes: 1 }).projectRootMarkers, [MARKER, '.git']);
+    check(`marker(${label}): idempotent`, run(instructionsApply, { projectRootMarkers: [MARKER, '.git'] }).projectRootMarkers, [MARKER, '.git']);
+    check(`marker(${label}): other plugins untouched`, run(() => {}, { projectRootMarkers: ['.git'] }).projectRootMarkers, ['.git']);
+  }
   effects[0]()();
-  check('marker: off after dispose', run(instructionsApply, { projectRootMarkers: ['.git'] }).projectRootMarkers, ['.git']);
+  for (const [label, run] of [['4.0', runLegacy], ['4.1', runModern]]) {
+    check(`marker(${label}): off after dispose`, run(instructionsApply, { projectRootMarkers: ['.git'] }).projectRootMarkers, ['.git']);
+  }
 }
 
 // ---------------------------------------------------------------- status

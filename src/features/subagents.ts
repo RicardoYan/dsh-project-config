@@ -56,8 +56,11 @@ export function admits(filter: ToolFilter | null | undefined, name: string): boo
 
 /**
  * Tools DSH registers on every agent's own scope rather than inheriting:
- * the web presets' `subagent` delegation tool (`modelSelectionSettings: true`
- * installs it per agent on `agent/created`) and its `list_subagent_models`.
+ * the web presets' `subagent` delegation tool (installed per agent on
+ * `agent/created` while the preset enables model selection) and its
+ * `list_subagent_models`. The preset option carrying that switch was renamed
+ * `modelSelectionSettings` → `modelSelection` in DSH 0.2.2; the tool names are
+ * unchanged either way.
  */
 export const PER_AGENT_TOOLS: ReadonlySet<string> = new Set(['subagent', 'list_subagent_models'])
 
