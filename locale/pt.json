@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Configuração do projeto (dsh-project-config)",
+    "description": "Subagentes, comandos, servidores MCP e hooks carregados por área de trabalho a partir de .dsh/settings.yml e do seu settings.local.yml pessoal."
+  }
+}

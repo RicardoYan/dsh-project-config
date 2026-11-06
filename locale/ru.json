@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Конфигурация проекта (dsh-project-config)",
+    "description": "Субагенты, команды, серверы MCP и hooks, загружаемые для каждой рабочей области из .dsh/settings.yml и вашего личного settings.local.yml."
+  }
+}

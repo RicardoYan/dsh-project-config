@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "プロジェクト設定 (dsh-project-config)",
+    "description": ".dsh/settings.yml と個人用の settings.local.yml から、ワークスペースごとにサブエージェント、コマンド、MCP サーバー、hooks を読み込みます。"
+  }
+}
