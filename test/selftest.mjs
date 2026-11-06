@@ -44,7 +44,8 @@ setLocaleSource(() => uiLang);
 const inLang = (l, fn) => { const prev = uiLang; uiLang = l; try { return fn(); } finally { uiLang = prev; } };
 const CJK = /[\u4e00-\u9fff]/;
 const { FileSystemSkillProvider } = await import('@deepseek-ai/dsh-skill-filesystem');
-const { apply: instructionsApply } = await import('@deepseek-ai/dsh-agent-instructions');
+const instructions = await import('@deepseek-ai/dsh-agent-instructions');
+const { apply: instructionsApply } = instructions;
 
 let passed = 0;
 const failures = [];
@@ -1219,6 +1220,54 @@ check('result: object', normalizeResult({ a: 1 }).text, '{\n  "a": 1\n}');
   for (const [label, run] of [['4.0', runLegacy], ['4.1', runModern]]) {
     check(`marker(${label}): off after dispose`, run(instructionsApply, { projectRootMarkers: ['.git'] }).projectRootMarkers, ['.git']);
   }
+}
+
+// ------------------------------------------------- isolation: the marker really roots the project
+// The block above only proves the hook rewrites the config. What it is FOR is
+// stopping discovery from walking up into an enclosing git repository, so this
+// one runs the real `discoverBaselineInstructionFiles` over a nested layout:
+//
+//   outer/        .git + AGENTS.md   ← an enclosing repository
+//   outer/inner/  .dsh/settings.yml + AGENTS.md   ← the project
+//
+// Ownership is asserted on `absolutePath`, never on `displayPath`: the inner
+// file renders as a bare `AGENTS.md` relative to cwd and the outer one can
+// render identically, so display paths cannot tell them apart.
+{
+  const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'isolation-')));
+  const outer = path.join(tmp, 'outer');
+  const inner = path.join(outer, 'inner');
+  fs.mkdirSync(path.join(outer, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(inner, '.dsh'), { recursive: true });
+  fs.writeFileSync(path.join(outer, 'AGENTS.md'), 'outer instructions\n');
+  fs.writeFileSync(path.join(inner, 'AGENTS.md'), 'inner instructions\n');
+  fs.writeFileSync(path.join(inner, '.dsh', 'settings.yml'), 'hooks: {}\n');
+  const home = path.join(tmp, 'home');
+  fs.mkdirSync(home, { recursive: true });
+
+  const discover = (projectRootMarkers) => instructions.discoverBaselineInstructionFiles({
+    cwd: inner,
+    dshHome: home,
+    projectRootMarkers,
+  });
+
+  const upstream = await discover(['.git']);
+  const withMarker = await discover([MARKER, '.git']);
+
+  const outerFile = path.join(outer, 'AGENTS.md');
+  const innerFile = path.join(inner, 'AGENTS.md');
+
+  // Baseline: upstream reads both, which is exactly the leak this plugin removes.
+  check('isolation: upstream default reads the enclosing repo',
+    upstream.some((f) => f.absolutePath === outerFile), true);
+  check('isolation: marker drops the enclosing repo',
+    withMarker.some((f) => f.absolutePath === outerFile), false);
+  check('isolation: marker keeps the project own file',
+    withMarker.some((f) => f.absolutePath === innerFile), true);
+  check('isolation: only the project file remains',
+    withMarker.filter((f) => f.absolutePath.endsWith('AGENTS.md')).length, 1);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------- status
