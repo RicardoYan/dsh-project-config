@@ -116,6 +116,37 @@ const tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'pcfg-'
 const mk = (...p) => { const d = path.join(tmp, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
 const write = (p, s = 'x') => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, s); return p; };
 
+// -------------------------------------------------- packaging completeness
+// `files` decides what the git/npm install actually contains. A module that is
+// committed and imported but left out of `files` disappears from the installed
+// tarball and the plugin fails to load with ERR_MODULE_NOT_FOUND.
+{
+  const root = path.resolve(import.meta.dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const patterns = (pkg.files ?? []).map((p) => p.split(path.sep).join('/'));
+  const covers = (rel) => patterns.some((pat) => (pat.includes('*')
+    ? new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$').test(rel)
+    : rel === pat || rel.startsWith(pat + '/')));
+  const missing = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      const rel = path.relative(root, full).split(path.sep).join('/');
+      if (!rel.startsWith('lib/') || !covers(rel)) continue;
+      const src = fs.readFileSync(full, 'utf8');
+      for (const m of src.matchAll(/from\s+['"](\.\.?\/[^'"]+)['"]/g)) {
+        let target = path.resolve(path.dirname(full), m[1]);
+        if (!target.endsWith('.js')) target += '.js';
+        const targetRel = path.relative(root, target).split(path.sep).join('/');
+        if (fs.existsSync(target) && !covers(targetRel)) missing.push(`${rel} -> ${targetRel}`);
+      }
+    }
+  };
+  walk(path.join(root, 'lib'));
+  check('packaging: every lib module is shipped', missing, []);
+}
+
 // ---------------------------------------------------------------- settings
 {
   const r = parseSettings(`
