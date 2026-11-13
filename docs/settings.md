@@ -90,8 +90,9 @@ description: 审查代码改动并指出问题
 ```yaml
 subagents:
   # 1. 只指定思考档。provider/model 不写 → 跟着主会话走
-  - toolName: res-phase3-auditor
-    personaFile: .dsh/agents/research-engine/res-phase3-auditor.md
+  #    （persona 放在子目录里也行，路径相对工作区根）
+  - toolName: code-auditor
+    personaFile: .dsh/agents/audit/code-auditor.md
     maxDepth: 3
     agentOptions:
       reasoningEffort: high
